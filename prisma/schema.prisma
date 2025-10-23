@@ -1,9 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -13,13 +7,773 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/**
+ * ---------- ENUMS ----------
+ */
+
+enum RefereeRole {
+  MAIN // главный судья
+  AR1 // ассистент 1
+  AR2 // ассистент 2
+  FOURTH // 4-й арбитр
+  VAR
+  AVAR
+  OBSERVER
+}
+
+enum MatchStatus {
+  SCHEDULED
+  LIVE
+  FINISHED
+}
+
+enum EventType {
+  GOAL
+  ASSIST
+  YELLOW_CARD
+  RED_CARD
+  SUBSTITUTION
+  PENALTY_SCORED
+  PENALTY_MISSED
+}
+
+enum LineupRole {
+  STARTER
+  SUBSTITUTE
+  RESERVE
+}
+
+enum FieldPosition {
+  GK
+  RB
+  CB
+  LB
+  RWB
+  LWB
+  DM
+  CM
+  AM
+  RW
+  LW
+  SS
+  ST
+}
+
+enum UserRole {
+  ADMIN
+  ORGANIZER
+  COACH
+  PLAYER
+  REFEREE
+}
+
+enum LeagueFormat {
+  F5x5   @map("5x5")
+  F6x6   @map("6x6")
+  F7x7   @map("7x7")
+  F8x8   @map("8x8")
+  F9x9   @map("9x9")
+  F10x10 @map("10x10")
+  F11x11 @map("11x11")
+}
+
+enum TournamentStage {
+  ROUND_OF_32
+  ROUND_OF_16
+  QUARTERFINAL
+  SEMIFINAL
+  FINAL
+  THIRD_PLACE
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELED
+}
+
+/**
+ * ---------- CORE: USERS / TEAMS / PLAYERS ----------
+ */
+
 model User {
+  id              Int       @id @default(autoincrement())
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  email           String    @unique
+  login           String    @unique
+  password        String
+  role            UserRole  @default(PLAYER)
+  isActive        Boolean   @default(true)
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  player          Player?
+
+  // 👇 вместо двух одинаковых TeamInvite[]
+  invitesSent     TeamInvite[] @relation("InvitesSent") // кто отправил
+  invitesReceived TeamInvite[] @relation("InvitesReceived") // кого пригласили
+
+  @@index([role])
+}
+
+model Team {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  title       String
+  logo        String[] @default([])
+  images      String[] @default([])
+  city        String
+  games       Int      @default(0)
+  wins        Int      @default(0)
+  goals       Int      @default(0)
+  tournaments Int      @default(0)
+
+  players        Player[]
+  matchesAsTeam1 Match[]          @relation("Team1Matches")
+  matchesAsTeam2 Match[]          @relation("Team2Matches")
+  events         MatchEvent[]
+  standings      LeagueStanding[]
+  TeamLineup     TeamLineup[]
+  leagues        LeagueTeam[]
+  invites        TeamInvite[] // исходящие инвайты из команды
+  TournamentTeam TournamentTeam[]
+}
+
+model Player {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  name      String
+  position  String
+  number    Int?
+  birthDate DateTime
+  images    String[] @default([])
+
+  userId Int?  @unique
+  user   User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  stats   PlayerStat[]
+  events  MatchEvent[] @relation("MainPlayer")
+  assists MatchEvent[] @relation("AssistPlayer")
+
+  teamId Int
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  playerMatches        PlayerMatch[]
+  TeamLineupItem       TeamLineupItem[]
+  LeagueTeamPlayer     LeagueTeamPlayer[]
+  invites              TeamInvite[]           @relation("InvitedPlayer") // входящие инвайты игроку
+  TournamentTeamPlayer TournamentTeamPlayer[]
+}
+
+/**
+ * ---------- LIGAS (чемпионаты, туры, матчи) ----------
+ */
+
+model League {
+  id                   Int          @id @default(autoincrement())
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+  title                String
+  season               String?
+  city                 String?
+  images               String[]     @default([])
+  format               LeagueFormat @default(F11x11)
+  halfMinutes          Int          @default(45)
+  startDate            DateTime?    @default(now())
+  registrationDeadline DateTime?
+  halves               Int          @default(2)
+
+  matches     Match[]
+  standings   LeagueStanding[]
+  teams       LeagueTeam[]
+  LeagueRound LeagueRound[]
+  News        News[]
+  Photo       Photo[]
+  Video       Video[]
+}
+
+model LeagueTeam {
+  id       Int    @id @default(autoincrement())
+  league   League @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+  leagueId Int
+  team     Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  teamId   Int
+
+  roster LeagueTeamPlayer[] @relation(name: "LeagueTeamRoster")
+
+  captainRosterItemId Int?              @unique
+  captainRosterItem   LeagueTeamPlayer? @relation(name: "LeagueTeamCaptain", fields: [captainRosterItemId], references: [id])
+
+  @@unique([leagueId, teamId])
+}
+
+model LeagueTeamPlayer {
+  id           Int        @id @default(autoincrement())
+  leagueTeamId Int
+  leagueTeam   LeagueTeam @relation(name: "LeagueTeamRoster", fields: [leagueTeamId], references: [id], onDelete: Cascade)
+
+  playerId Int
+  player   Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  number   Int?
+  position FieldPosition?
+  role     LineupRole?
+  notes    String?
+
+  captainOf LeagueTeam? @relation(name: "LeagueTeamCaptain")
+
+  @@unique([leagueTeamId, playerId])
+  @@index([leagueTeamId])
+}
+
+model TeamLineup {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  title     String?
+  formation String?
+  isDefault Boolean  @default(false)
+
+  teamId Int
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  items TeamLineupItem[]
+
+  @@index([teamId, isDefault])
+}
+
+model TeamLineupItem {
+  id        Int            @id @default(autoincrement())
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+  lineupId  Int
+  lineup    TeamLineup     @relation(fields: [lineupId], references: [id], onDelete: Cascade)
+  playerId  Int
+  player    Player         @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  role      LineupRole     @default(STARTER)
+  position  FieldPosition?
+  order     Int            @default(0)
+  isCaptain Boolean        @default(false)
+
+  @@unique([lineupId, playerId])
+  @@index([lineupId, role, order])
+}
+
+model LeagueRound {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  leagueId  Int
+  league    League   @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+
+  name   String
+  number Int?
+  date   DateTime?
+
+  matches Match[]
+
+  @@unique([leagueId, number])
+  @@index([leagueId, date])
+}
+
+model Match {
+  id        Int         @id @default(autoincrement())
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+  date      DateTime
+  status    MatchStatus @default(SCHEDULED)
+
+  leagueId Int
+  league   League @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+
+  roundId Int?
+  round   LeagueRound? @relation(fields: [roundId], references: [id], onDelete: SetNull)
+
+  team1Id Int
+  team1   Team @relation("Team1Matches", fields: [team1Id], references: [id], onDelete: Cascade)
+
+  team2Id Int
+  team2   Team @relation("Team2Matches", fields: [team2Id], references: [id], onDelete: Cascade)
+
+  team1Score Int @default(0)
+  team2Score Int @default(0)
+
+  stadiumId  Int?
+  stadiumRel Stadium? @relation(fields: [stadiumId], references: [id], onDelete: SetNull)
+
+  matchReferees MatchReferee[]
+  events        MatchEvent[]
+  participants  PlayerMatch[]
+
+  homeFormation  String?
+  guestFormation String?
+  homeCoach      String?
+  guestCoach     String?
+  News           News[]
+  Photo          Photo[]
+  Video          Video[]
+
+  @@index([leagueId, roundId])
+  @@index([leagueId, team1Id, team2Id])
+}
+
+model MatchReferee {
+  id        Int          @id @default(autoincrement())
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+  matchId   Int
+  refereeId Int
+  role      RefereeRole?
+
+  match   Match   @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  referee Referee @relation(fields: [refereeId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, refereeId])
+}
+
+model MatchEvent {
+  id          Int       @id @default(autoincrement())
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  minute      Int
+  half        Int
+  type        EventType
+  description String?
+
+  playerId Int?
+  player   Player? @relation("MainPlayer", fields: [playerId], references: [id], onDelete: SetNull)
+
+  assistPlayerId Int?
+  assist_player  Player? @relation("AssistPlayer", fields: [assistPlayerId], references: [id], onDelete: SetNull)
+
+  teamId Int
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  matchId Int
+  match   Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  issuedByRefereeId Int?
+  issuedByReferee   Referee? @relation(fields: [issuedByRefereeId], references: [id], onDelete: SetNull)
+
+  @@index([issuedByRefereeId])
+}
+
+model PlayerMatch {
+  id       Int @id @default(autoincrement())
+  playerId Int
+  matchId  Int
+
+  role       LineupRole     @default(STARTER)
+  position   FieldPosition?
+  isCaptain  Boolean        @default(false)
+  order      Int            @default(0)
+  minutesIn  Int?
+  minutesOut Int?
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  match  Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, matchId])
+  @@index([matchId, role, order])
+}
+
+model PlayerStat {
+  id            Int @id @default(autoincrement())
+  goals         Int @default(0)
+  assists       Int @default(0)
+  yellow_cards  Int @default(0)
+  red_cards     Int @default(0)
+  matchesPlayed Int @default(0)
+
+  playerId Int    @unique
+  player   Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+}
+
+model LeagueStanding {
+  id            Int @id @default(autoincrement())
+  league_id     Int
+  team_id       Int
+  played        Int @default(0)
+  wins          Int @default(0)
+  draws         Int @default(0)
+  losses        Int @default(0)
+  goals_for     Int @default(0)
+  goals_against Int @default(0)
+  points        Int @default(0)
+
+  league League @relation(fields: [league_id], references: [id], onDelete: Cascade)
+  team   Team   @relation(fields: [team_id], references: [id], onDelete: Cascade)
+
+  @@unique([league_id, team_id])
+  @@index([league_id])
+  @@index([team_id])
+}
+
+/**
+ * ---------- REF / NEWS / MEDIA ----------
+ */
+
+model Referee {
+  id                     Int                      @id @default(autoincrement())
+  createdAt              DateTime                 @default(now()) @map("created_at")
+  updatedAt              DateTime                 @updatedAt @map("updated_at")
+  name                   String
+  matchRefs              MatchReferee[]
+  TournamentMatchReferee TournamentMatchReferee[]
+  MatchEvent             MatchEvent[]
+  TournamentMatchEvent   TournamentMatchEvent[]
+}
+
+model Stadium {
+  id              Int               @id @default(autoincrement())
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  name            String
+  location        String?
+  matches         Match[]
+  TournamentMatch TournamentMatch[]
+}
+
+model Partner {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  name      String
+  images    String[] @default([])
+  link      String?
+}
+
+model News {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  title       String
+  description String
+  images      String[] @default([])
+  videos      String[] @default([])
+  date        DateTime @default(now())
+
+  leagueId     Int?
+  league       League?     @relation(fields: [leagueId], references: [id], onDelete: SetNull)
+  matchId      Int?
+  match        Match?      @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  tournamentId Int?
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+
+  @@index([leagueId])
+  @@index([matchId])
+  @@index([tournamentId])
+}
+
+model Photo {
+  id        Int       @id @default(autoincrement())
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  images    String[]
+  title     String?
+  date      DateTime?
+
+  leagueId     Int?
+  league       League?     @relation(fields: [leagueId], references: [id], onDelete: SetNull)
+  matchId      Int?
+  match        Match?      @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  tournamentId Int?
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+
+  @@index([leagueId])
+  @@index([matchId])
+  @@index([tournamentId])
+}
+
+model Video {
+  id        Int       @id @default(autoincrement())
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  url       String?
+  videos    String[]
+  title     String?
+  date      DateTime?
+
+  leagueId     Int?
+  league       League?     @relation(fields: [leagueId], references: [id], onDelete: SetNull)
+  matchId      Int?
+  match        Match?      @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  tournamentId Int?
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+
+  @@index([leagueId])
+  @@index([matchId])
+  @@index([tournamentId])
+}
+
+/**
+ * ---------- TOURNAMENTS (плей-офф) ----------
+ */
+
+model Tournament {
+  id                   Int       @id @default(autoincrement())
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+  title                String
+  season               String?
+  city                 String?
+  images               String[]  @default([])
+  halfMinutes          Int       @default(45)
+  halves               Int       @default(2)
+  startDate            DateTime? @default(now())
+  registrationDeadline DateTime?
+
+  teams   TournamentTeam[]
+  rounds  TournamentRound[]
+  ties    TournamentTie[]
+  matches TournamentMatch[]
+  News    News[]
+  Photo   Photo[]
+  Video   Video[]
+
+  @@index([startDate])
+}
+
+model TournamentTeam {
+  id           Int        @id @default(autoincrement())
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  teamId       Int
+  team         Team       @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  seed         Int?
+
+  roster TournamentTeamPlayer[] @relation(name: "TournamentTeamRoster")
+
+  captainRosterItemId Int?                  @unique
+  captainRosterItem   TournamentTeamPlayer? @relation(name: "TournamentTeamCaptain", fields: [captainRosterItemId], references: [id])
+
+  // ✅ правильные обратные связи к TournamentTie
+  tiesAsTeam1 TournamentTie[] @relation("TieTeam1")
+  tiesAsTeam2 TournamentTie[] @relation("TieTeam2")
+  wonTies     TournamentTie[] @relation("TieWinner")
+
+  // матчи
+  matchesAsTeam1 TournamentMatch[] @relation("TMatchTeam1")
+  matchesAsTeam2 TournamentMatch[] @relation("TMatchTeam2")
+
+  // события матча турнира (опционально)
+  TournamentMatchEvent TournamentMatchEvent[]
+
+  @@unique([tournamentId, teamId])
+  @@index([tournamentId, seed])
+}
+
+model TournamentTeamPlayer {
+  id               Int            @id @default(autoincrement())
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+  tournamentTeamId Int
+  tournamentTeam   TournamentTeam @relation(name: "TournamentTeamRoster", fields: [tournamentTeamId], references: [id], onDelete: Cascade)
+
+  playerId Int
+  player   Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  number   Int?
+  position FieldPosition?
+  role     LineupRole?
+  notes    String?
+
+  captainOf TournamentTeam? @relation(name: "TournamentTeamCaptain")
+
+  matches      TournamentPlayerMatch[]
+  eventsMain   TournamentMatchEvent[]  @relation("TMainRosterItem")
+  eventsAssist TournamentMatchEvent[]  @relation("TAssistRosterItem")
+
+  @@unique([tournamentTeamId, playerId])
+  @@index([tournamentTeamId])
+}
+
+model TournamentRound {
+  id           Int        @id @default(autoincrement())
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  stage  TournamentStage
+  name   String?
+  number Int?
+  date   DateTime?
+
+  ties    TournamentTie[]
+  matches TournamentMatch[]
+
+  @@unique([tournamentId, stage, number])
+  @@index([tournamentId, stage, date])
+}
+
+model TournamentTie {
+  id           Int             @id @default(autoincrement())
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+  tournamentId Int
+  tournament   Tournament      @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  roundId      Int
+  round        TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  team1TTId Int
+  team1TT   TournamentTeam @relation("TieTeam1", fields: [team1TTId], references: [id], onDelete: Cascade)
+  team2TTId Int
+  team2TT   TournamentTeam @relation("TieTeam2", fields: [team2TTId], references: [id], onDelete: Cascade)
+
+  legs Int @default(1)
+
+  winnerTTId Int?
+  winnerTT   TournamentTeam? @relation("TieWinner", fields: [winnerTTId], references: [id], onDelete: SetNull)
+
+  matches TournamentMatch[]
+
+  @@index([tournamentId, roundId])
+}
+
+model TournamentMatch {
+  id        Int         @id @default(autoincrement())
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+  date      DateTime
+  status    MatchStatus @default(SCHEDULED)
+
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  roundId Int
+  round   TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  tieId Int?
+  tie   TournamentTie? @relation(fields: [tieId], references: [id], onDelete: SetNull)
+
+  team1TTId Int
+  team1TT   TournamentTeam @relation("TMatchTeam1", fields: [team1TTId], references: [id], onDelete: Cascade)
+  team2TTId Int
+  team2TT   TournamentTeam @relation("TMatchTeam2", fields: [team2TTId], references: [id], onDelete: Cascade)
+
+  team1Score Int  @default(0)
+  team2Score Int  @default(0)
+  legNumber  Int?
+
+  stadiumId  Int?
+  stadiumRel Stadium? @relation(fields: [stadiumId], references: [id], onDelete: SetNull)
+
+  referees     TournamentMatchReferee[]
+  events       TournamentMatchEvent[]
+  participants TournamentPlayerMatch[]
+
+  team1Formation String?
+  team2Formation String?
+  team1Coach     String?
+  team2Coach     String?
+
+  @@index([tournamentId, roundId, tieId])
+  @@index([team1TTId, team2TTId])
+}
+
+model TournamentMatchReferee {
+  id        Int          @id @default(autoincrement())
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+  matchId   Int
+  refereeId Int
+  role      RefereeRole?
+
+  match   TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  referee Referee         @relation(fields: [refereeId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, refereeId])
+}
+
+model TournamentMatchEvent {
+  id          Int       @id @default(autoincrement())
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  minute      Int
+  half        Int
+  type        EventType
+  description String?
+
+  tournamentTeamId Int
+  tournamentTeam   TournamentTeam @relation(fields: [tournamentTeamId], references: [id], onDelete: Cascade)
+
+  rosterItemId       Int?
+  rosterItem         TournamentTeamPlayer? @relation("TMainRosterItem", fields: [rosterItemId], references: [id], onDelete: SetNull)
+  assistRosterItemId Int?
+  assistRosterItem   TournamentTeamPlayer? @relation("TAssistRosterItem", fields: [assistRosterItemId], references: [id], onDelete: SetNull)
+
+  matchId Int
+  match   TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  issuedByRefereeId Int?
+  issuedByReferee   Referee? @relation(fields: [issuedByRefereeId], references: [id], onDelete: SetNull)
+
+  @@index([issuedByRefereeId])
+  @@index([matchId, tournamentTeamId, minute])
+}
+
+model TournamentPlayerMatch {
+  id        Int             @id @default(autoincrement())
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+  matchId   Int
+  match     TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  tournamentTeamPlayerId Int
+  tournamentTeamPlayer   TournamentTeamPlayer @relation(fields: [tournamentTeamPlayerId], references: [id], onDelete: Cascade)
+
+  role       LineupRole     @default(STARTER)
+  position   FieldPosition?
+  isCaptain  Boolean        @default(false)
+  order      Int            @default(0)
+  minutesIn  Int?
+  minutesOut Int?
+
+  @@unique([matchId, tournamentTeamPlayerId])
+  @@index([matchId, role, order])
+}
+
+/**
+ * ---------- INVITES (приглашения в команду) ----------
+ */
+
+model TeamInvite {
   id        Int      @id @default(autoincrement())
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  email    String @unique
-  login    String @unique
-  name     String
-  password String
+  teamId Int
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  invitedPlayerId Int?
+  invitedPlayer   Player? @relation("InvitedPlayer", fields: [invitedPlayerId], references: [id], onDelete: SetNull)
+
+  invitedUserId Int?
+  invitedUser   User? @relation("InvitesReceived", fields: [invitedUserId], references: [id], onDelete: SetNull)
+
+  inviterUserId Int
+  inviter       User @relation("InvitesSent", fields: [inviterUserId], references: [id], onDelete: Cascade)
+
+  desiredNumber   Int?
+  desiredPosition FieldPosition?
+  message         String?
+
+  status      InvitationStatus @default(PENDING)
+  token       String           @unique
+  expiresAt   DateTime?
+  respondedAt DateTime?
+
+  email String?
+
+  @@index([teamId, status])
+  @@index([invitedPlayerId])
+  @@index([invitedUserId])
+  @@index([email])
 }
