@@ -4,9 +4,10 @@ import morgan from 'morgan';
 import cors from 'cors';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
-import https from 'https';
+// import fs from 'fs';
+// import https from 'https';
 
+import http from 'http';
 import { errorHandler, notFound } from './app/middleware/error.middleware.js';
 import { prisma } from './app/prisma.js';
 
@@ -32,24 +33,17 @@ import leagueTeamRouter from './app/controllers/leagueTeam.js';
 import tournamentRouter from './app/controllers/tourtament.js';
 import leagueExportRouter from './app/controllers/leagueExport.js';
 
+import { initSocket } from './app/socket.js';
+
 dotenv.config();
 
 const app = express();
-
-// const sslOptions = {
-//   key: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/privkey.pem'),
-//   cert: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/cert.pem'),
-//   ca: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/chain.pem'),
-// };
-
-// const httpsServer = https.createServer(sslOptions, app);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 app.use(cors());
-
-// 👇 добавь после cors()
+// Чтобы React Admin видел Content-Range
 app.use((req, res, next) => {
   res.header('Access-Control-Expose-Headers', 'Content-Range');
   next();
@@ -84,10 +78,19 @@ app.use('/api/leagues', leagueExportRouter);
 app.use(notFound);
 app.use(errorHandler);
 
-const PORT = 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// --- HTTP + Socket.IO ---
+const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+const server = http.createServer(app);
+initSocket(server);
+server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
 
-// const PORT = 443;
-// httpsServer.listen(PORT, () => {
-//   console.log('Server is now running on https 443');
-// });
+/* --- Вариант HTTPS (если нужно):
+const sslOptions = {
+  key: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/privkey.pem'),
+  cert: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/cert.pem'),
+  ca: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/chain.pem'),
+};
+const httpsServer = https.createServer(sslOptions, app);
+initSocket(httpsServer);
+httpsServer.listen(443, () => console.log('Server is now running on https 443'));
+*/

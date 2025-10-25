@@ -1,6 +1,7 @@
 // app/controllers/matchEvent.js
 import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { getIO } from '../socket.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -134,14 +135,7 @@ async function recomputeMatchScore(tx, matchId) {
   });
 }
 
-/* =========================================================
-   LIST  GET /match-events
-   filter:
-     id[], matchId, teamId, playerId, assistPlayerId, type[], half, minute_gte/lte, goalOnly
-   sort:
-     ["id"|"minute"|"half"|"createdAt"|"match.date", "ASC"|"DESC"]
-   include=player,assist_player,team,issuedByReferee,match
-   ========================================================= */
+/* ================= LIST ================= */
 router.get('/', async (req, res) => {
   try {
     const range = safeJSON(req.query.range, [0, 9999]);
@@ -257,9 +251,7 @@ router.get('/by-match/:matchId(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   ITEM  GET /match-events/:id
-   ========================================================= */
+/* ================= ITEM ================= */
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -284,9 +276,7 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   CREATE  POST /match-events
-   ========================================================= */
+/* ================= CREATE ================= */
 router.post('/', async (req, res) => {
   try {
     const {
@@ -306,7 +296,7 @@ router.post('/', async (req, res) => {
         .json({ error: 'matchId, teamId и type обязательны' });
     }
 
-    const issuedByRefereeId = pickRefId(req.body); // <-- судья
+    const issuedByRefereeId = pickRefId(req.body);
 
     const created = await prisma.$transaction(async (tx) => {
       // валидации
@@ -317,13 +307,12 @@ router.post('/', async (req, res) => {
       );
       if (playerId)
         await assertPlayerBelongsToTeam(tx, Number(playerId), Number(teamId));
-      if (assistPlayerId) {
+      if (assistPlayerId)
         await assertPlayerBelongsToTeam(
           tx,
           Number(assistPlayerId),
           Number(teamId)
         );
-      }
 
       // создать событие
       const ev = await tx.matchEvent.create({
@@ -335,7 +324,7 @@ router.post('/', async (req, res) => {
           playerId: playerId != null ? Number(playerId) : null,
           assistPlayerId:
             assistPlayerId != null ? Number(assistPlayerId) : null,
-          issuedByRefereeId, // <-- сохраняем судью
+          issuedByRefereeId,
           teamId: Number(teamId),
           matchId: Number(matchId),
         },
@@ -363,6 +352,29 @@ router.post('/', async (req, res) => {
       });
     });
 
+    // 🔔 Socket: событие
+    const io = getIO();
+    io.to(`match:${created.matchId}`).emit('event:created', created);
+
+    // 🔔 Socket: актуальный счёт
+    const m = await prisma.match.findUnique({
+      where: { id: created.matchId },
+      select: {
+        id: true,
+        leagueId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    if (m) {
+      io.to(`match:${m.id}`).emit('match:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`league:${m.leagueId}`).emit('match:update', m);
+    }
+
     res.status(201).json(created);
   } catch (err) {
     console.error('POST /match-events', err);
@@ -372,9 +384,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-/* =========================================================
-   PATCH  /match-events/:id
-   ========================================================= */
+/* ================= PATCH ================= */
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -389,10 +399,10 @@ router.patch('/:id(\\d+)', async (req, res) => {
     } = req.body;
 
     const newRefId =
-      req.body.hasOwnProperty('issuedByRefereeId') ||
-      req.body.hasOwnProperty('refereeId') ||
-      req.body.hasOwnProperty('issued_by_referee_id')
-        ? pickRefId(req.body) // поддерживаем явное обновление судьи
+      Object.prototype.hasOwnProperty.call(req.body, 'issuedByRefereeId') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'refereeId') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'issued_by_referee_id')
+        ? pickRefId(req.body)
         : undefined;
 
     const updated = await prisma.$transaction(async (tx) => {
@@ -449,7 +459,7 @@ router.patch('/:id(\\d+)', async (req, res) => {
         await incrementStat(tx, newAssistId, 'ASSIST');
       }
 
-      // если тип менялся/или был гол — пересчитать счёт
+      // если тип/команда/гол — пересчитать счёт
       if (
         isGoalType(newType) ||
         isGoalType(old.type) ||
@@ -470,6 +480,28 @@ router.patch('/:id(\\d+)', async (req, res) => {
       });
     });
 
+    // 🔔 Socket
+    const io = getIO();
+    io.to(`match:${updated.matchId}`).emit('event:updated', updated);
+
+    const m = await prisma.match.findUnique({
+      where: { id: updated.matchId },
+      select: {
+        id: true,
+        leagueId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    if (m) {
+      io.to(`match:${m.id}`).emit('match:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`league:${m.leagueId}`).emit('match:update', m);
+    }
+
     res.json(updated);
   } catch (err) {
     console.error('PATCH /match-events/:id', err);
@@ -479,22 +511,18 @@ router.patch('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   PUT (полная замена) — проксируем в PATCH
-   ========================================================= */
+/* ================= PUT -> PATCH ================= */
 router.put('/:id(\\d+)', async (req, res) => {
   req.params.id = String(req.params.id);
   return router.handle({ ...req, method: 'PATCH', url: req.url }, res);
 });
 
-/* =========================================================
-   DELETE  /match-events/:id
-   ========================================================= */
+/* ================= DELETE ================= */
 router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    await prisma.$transaction(async (tx) => {
+    const deletedInfo = await prisma.$transaction(async (tx) => {
       const old = await tx.matchEvent.findUnique({ where: { id } });
       if (!old) throw new Error('Событие не найдено');
 
@@ -505,7 +533,34 @@ router.delete('/:id(\\d+)', async (req, res) => {
         await decrementStat(tx, old.assistPlayerId, 'ASSIST');
       }
       if (isGoalType(old.type)) await recomputeMatchScore(tx, old.matchId);
+
+      return { oldMatchId: old.matchId };
     });
+
+    // 🔔 Socket
+    const io = getIO();
+    io.to(`match:${deletedInfo.oldMatchId}`).emit('event:deleted', {
+      id,
+      matchId: deletedInfo.oldMatchId,
+    });
+
+    const m = await prisma.match.findUnique({
+      where: { id: deletedInfo.oldMatchId },
+      select: {
+        id: true,
+        leagueId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    if (m) {
+      io.to(`match:${m.id}`).emit('match:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`league:${m.leagueId}`).emit('match:update', m);
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -516,17 +571,32 @@ router.delete('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   RECOMPUTE SCORE  POST /match-events/recompute-score/:matchId
-   ========================================================= */
+/* ================= RECOMPUTE SCORE ================= */
 router.post('/recompute-score/:matchId(\\d+)', async (req, res) => {
   try {
     const matchId = Number(req.params.matchId);
     await prisma.$transaction((tx) => recomputeMatchScore(tx, matchId));
     const m = await prisma.match.findUnique({
       where: { id: matchId },
-      select: { id: true, team1Score: true, team2Score: true },
+      select: {
+        id: true,
+        leagueId: true,
+        team1Score: true,
+        team2Score: true,
+      },
     });
+
+    // 🔔 Socket
+    const io = getIO();
+    if (m) {
+      io.to(`match:${m.id}`).emit('match:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`league:${m.leagueId}`).emit('match:update', m);
+    }
+
     res.json(m);
   } catch (e) {
     console.error('POST /match-events/recompute-score/:matchId', e);
@@ -534,9 +604,7 @@ router.post('/recompute-score/:matchId(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   BULK CREATE  POST /match-events/bulk
-   ========================================================= */
+/* ================= BULK CREATE ================= */
 router.post('/bulk', async (req, res) => {
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -565,13 +633,12 @@ router.post('/bulk', async (req, res) => {
         );
         if (playerId)
           await assertPlayerBelongsToTeam(tx, Number(playerId), Number(teamId));
-        if (assistPlayerId) {
+        if (assistPlayerId)
           await assertPlayerBelongsToTeam(
             tx,
             Number(assistPlayerId),
             Number(teamId)
           );
-        }
 
         const issuedByRefereeId = pickRefId(raw);
 
@@ -600,6 +667,43 @@ router.post('/bulk', async (req, res) => {
       }
       return created;
     });
+
+    // 🔔 Socket
+    const io = getIO();
+    const matchId = results[0]?.matchId;
+    if (matchId) {
+      // подтянем объекты с инклюдами для фронта
+      const detailed = await prisma.matchEvent.findMany({
+        where: { id: { in: results.map((r) => r.id) } },
+        include: {
+          player: true,
+          assist_player: true,
+          team: true,
+          issuedByReferee: true,
+          match: true,
+        },
+        orderBy: [{ half: 'asc' }, { minute: 'asc' }, { id: 'asc' }],
+      });
+      io.to(`match:${matchId}`).emit('events:bulkCreated', detailed);
+
+      const m = await prisma.match.findUnique({
+        where: { id: matchId },
+        select: {
+          id: true,
+          leagueId: true,
+          team1Score: true,
+          team2Score: true,
+        },
+      });
+      if (m) {
+        io.to(`match:${m.id}`).emit('match:score', {
+          matchId: m.id,
+          team1Score: m.team1Score,
+          team2Score: m.team2Score,
+        });
+        io.to(`league:${m.leagueId}`).emit('match:update', m);
+      }
+    }
 
     res.status(201).json({ count: results.length, items: results });
   } catch (e) {

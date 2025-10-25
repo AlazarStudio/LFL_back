@@ -1,6 +1,7 @@
 // app/controllers/match.js
 import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { getIO } from '../socket.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -61,7 +62,6 @@ const buildInclude = (p) => {
 };
 
 /* ---------------- validations ---------------- */
-// команды должны быть заявлены в этой лиге (через LeagueTeam)
 async function assertTeamsInLeague(leagueId, team1Id, team2Id) {
   if (!Number.isFinite(leagueId)) throw new Error('Некорректная лига');
   if (!Number.isFinite(team1Id) || !Number.isFinite(team2Id))
@@ -79,7 +79,6 @@ async function assertTeamsInLeague(leagueId, team1Id, team2Id) {
 }
 
 /* ---------------- score & standings ---------------- */
-// пересчёт счёта матча на основе событий (GOAL|PENALTY_SCORED)
 async function recomputeMatchScore(matchId) {
   await prisma.$transaction(async (tx) => {
     const grouped = await tx.matchEvent.groupBy({
@@ -89,20 +88,33 @@ async function recomputeMatchScore(matchId) {
     });
     const m = await tx.match.findUnique({
       where: { id: matchId },
-      select: { id: true, team1Id: true, team2Id: true },
+      select: {
+        id: true,
+        team1Id: true,
+        team2Id: true,
+        leagueId: true,
+      },
     });
     if (!m) return;
     const map = new Map(grouped.map((g) => [g.teamId, g._count._all]));
     const team1Score = map.get(m.team1Id) || 0;
     const team2Score = map.get(m.team2Id) || 0;
-    await tx.match.update({
+    const updated = await tx.match.update({
       where: { id: matchId },
       data: { team1Score, team2Score },
     });
+    // эмитим свежий счёт
+    try {
+      const io = getIO();
+      io.to(`match:${matchId}`).emit('match:score', {
+        matchId,
+        team1Score: updated.team1Score,
+        team2Score: updated.team2Score,
+      });
+    } catch {}
   });
 }
 
-// быстрый пересчёт standings лиги (FINISHED матчи)
 async function recalcStandings(leagueId) {
   await prisma.$transaction(async (tx) => {
     const matches = await tx.match.findMany({
@@ -161,16 +173,14 @@ async function recalcStandings(leagueId) {
     }));
     if (data.length) await tx.leagueStanding.createMany({ data });
   });
+  // уведомим подписчиков лиги
+  try {
+    const io = getIO();
+    io.to(`league:${leagueId}`).emit('standings:changed', { leagueId });
+  } catch {}
 }
 
-/* =========================================================
-   LIST  GET /matches
-   filter:
-     id[], leagueId, roundId, status (string|array),
-     teamIdAny, date_gte/lte, q (по названию команд)
-   sort: ["date"|"id"|"status","ASC"|"DESC"]
-   include=league,round,stadium,team1,team2,referees,events,participants
-   ========================================================= */
+/* ===================== LIST ===================== */
 router.get('/', async (req, res) => {
   try {
     const range = safeJSON(req.query.range, [0, 49]);
@@ -263,12 +273,7 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   CREATE  POST /matches
-   body: { leagueId, team1Id, team2Id, date?, status?, stadiumId?, roundId?,
-           team1Score?, team2Score?, team1Formation?, team2Formation?, team1Coach?, team2Coach?,
-           matchReferees?: [{refereeId, role?}] }
-   ========================================================= */
+/* CREATE */
 router.post('/', async (req, res) => {
   try {
     const {
@@ -318,6 +323,13 @@ router.post('/', async (req, res) => {
       include: buildInclude('league,stadium,team1,team2,referees'),
     });
 
+    // Realtime
+    try {
+      const io = getIO();
+      io.to(`league:${created.leagueId}`).emit('match:created', created);
+      io.to(`match:${created.id}`).emit('match:update', created);
+    } catch {}
+
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /matches', e);
@@ -325,9 +337,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-/* =========================================================
-   PATCH  /matches/:id  (частичный апдейт с проверками)
-   ========================================================= */
+/* PATCH */
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -372,10 +382,15 @@ router.patch('/:id(\\d+)', async (req, res) => {
 
     const updated = await prisma.match.update({ where: { id }, data: patch });
 
-    // если перевели в FINISHED — пересчёт таблицы
-    if (patch.status === 'FINISHED') {
-      await recalcStandings(updated.leagueId);
-    }
+    // Realtime
+    try {
+      const io = getIO();
+      io.to(`match:${id}`).emit('match:update', updated);
+      if (patch.status === 'FINISHED') {
+        await recalcStandings(updated.leagueId);
+      }
+    } catch {}
+
     res.json(updated);
   } catch (e) {
     console.error('PATCH /matches/:id', e);
@@ -383,7 +398,7 @@ router.patch('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* полная замена → через PATCH */
+/* PUT -> PATCH */
 router.put('/:id(\\d+)', async (req, res) => {
   req.method = 'PATCH';
   return router.handle(req, res);
@@ -393,7 +408,19 @@ router.put('/:id(\\d+)', async (req, res) => {
 router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    await prisma.match.delete({ where: { id } }); // каскады удалят events/referees/participants
+    const old = await prisma.match.findUnique({
+      where: { id },
+      select: { id: true, leagueId: true },
+    });
+    await prisma.match.delete({ where: { id } });
+    try {
+      const io = getIO();
+      io.to(`league:${old?.leagueId}`).emit('match:deleted', {
+        id,
+        leagueId: old?.leagueId,
+      });
+      io.to(`match:${id}`).emit('match:deleted', { id });
+    } catch {}
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /matches/:id', e);
@@ -401,11 +428,7 @@ router.delete('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   Доп. ручки: статусы, счёт, события, судьи, участники
-   ========================================================= */
-
-// статусы
+/* -------- статусы -------- */
 router.post('/:id(\\d+)/start', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -413,22 +436,45 @@ router.post('/:id(\\d+)/start', async (req, res) => {
       where: { id },
       data: { status: 'LIVE' },
     });
+    try {
+      const io = getIO();
+      io.to(`match:${id}`).emit('match:status', {
+        matchId: id,
+        status: 'LIVE',
+      });
+      io.to(`league:${m.leagueId}`).emit('match:status', {
+        matchId: id,
+        status: 'LIVE',
+      });
+    } catch {}
     res.json(m);
   } catch (e) {
     console.error('POST /matches/:id/start', e);
     res.status(400).json({ error: 'Не удалось перевести матч в LIVE' });
   }
 });
+
 router.post('/:id(\\d+)/finish', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    // обновим счёт из событий перед финишем
     await recomputeMatchScore(id);
     const m = await prisma.match.update({
       where: { id },
       data: { status: 'FINISHED' },
     });
     await recalcStandings(m.leagueId);
+    try {
+      const io = getIO();
+      io.to(`match:${id}`).emit('match:status', {
+        matchId: id,
+        status: 'FINISHED',
+      });
+      io.to(`match:${id}`).emit('match:score', {
+        matchId: id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+    } catch {}
     res.json(m);
   } catch (e) {
     console.error('POST /matches/:id/finish', e);
@@ -436,7 +482,6 @@ router.post('/:id(\\d+)/finish', async (req, res) => {
   }
 });
 
-// ручное обновление счёта (и синхронизация standings при необходимости)
 router.post('/:id(\\d+)/score', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -446,7 +491,15 @@ router.post('/:id(\\d+)/score', async (req, res) => {
       where: { id },
       data: { team1Score, team2Score },
     });
-    if (m.status === 'FINISHED') await recalcStandings(m.leagueId);
+    try {
+      const io = getIO();
+      io.to(`match:${id}`).emit('match:score', {
+        matchId: id,
+        team1Score,
+        team2Score,
+      });
+      if (m.status === 'FINISHED') await recalcStandings(m.leagueId);
+    } catch {}
     res.json(m);
   } catch (e) {
     console.error('POST /matches/:id/score', e);
@@ -454,7 +507,7 @@ router.post('/:id(\\d+)/score', async (req, res) => {
   }
 });
 
-// события матча (удобная выборка; CRUD — в контроллере matchEvent)
+/* -------- удобные выборки -------- */
 router.get('/:id(\\d+)/events', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -470,7 +523,6 @@ router.get('/:id(\\d+)/events', async (req, res) => {
   }
 });
 
-// судьи
 router.get('/:id(\\d+)/referees', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -485,6 +537,7 @@ router.get('/:id(\\d+)/referees', async (req, res) => {
     res.status(500).json({ error: 'Ошибка загрузки судей' });
   }
 });
+
 router.post('/:id(\\d+)/referees', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -506,12 +559,17 @@ router.post('/:id(\\d+)/referees', async (req, res) => {
       where: { matchId: id },
       include: { referee: true },
     });
+    // уведомим о смене судей как обновление матча
+    try {
+      getIO().to(`match:${id}`).emit('match:referees', rows);
+    } catch {}
     res.json(rows);
   } catch (e) {
     console.error('POST /matches/:id/referees', e);
     res.status(400).json({ error: 'Не удалось сохранить судей' });
   }
 });
+
 router.post('/:id(\\d+)/referees/assign', async (req, res) => {
   try {
     const matchId = Number(req.params.id);
@@ -524,12 +582,16 @@ router.post('/:id(\\d+)/referees/assign', async (req, res) => {
       update: { role },
       create: { matchId, refereeId, role },
     });
+    try {
+      getIO().to(`match:${matchId}`).emit('match:refereesAssigned', row);
+    } catch {}
     res.json(row);
   } catch (e) {
     console.error('POST /matches/:id/referees/assign', e);
     res.status(400).json({ error: 'Не удалось назначить судью' });
   }
 });
+
 router.delete('/:id(\\d+)/referees/:refId(\\d+)', async (req, res) => {
   try {
     const matchId = Number(req.params.id);
@@ -537,6 +599,11 @@ router.delete('/:id(\\d+)/referees/:refId(\\d+)', async (req, res) => {
     await prisma.matchReferee.delete({
       where: { matchId_refereeId: { matchId, refereeId } },
     });
+    try {
+      getIO()
+        .to(`match:${matchId}`)
+        .emit('match:refereeRemoved', { matchId, refereeId });
+    } catch {}
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /matches/:id/referees/:refId', e);
@@ -544,7 +611,6 @@ router.delete('/:id(\\d+)/referees/:refId(\\d+)', async (req, res) => {
   }
 });
 
-// участники (PlayerMatch)
 router.get('/:id(\\d+)/participants', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -559,7 +625,7 @@ router.get('/:id(\\d+)/participants', async (req, res) => {
     res.status(500).json({ error: 'Ошибка загрузки участников' });
   }
 });
-// замена состава целиком
+
 router.put('/:id(\\d+)/participants', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -589,6 +655,9 @@ router.put('/:id(\\d+)/participants', async (req, res) => {
       where: { matchId: id },
       include: { player: true },
     });
+    try {
+      getIO().to(`match:${id}`).emit('match:participants', rows);
+    } catch {}
     res.json(rows);
   } catch (e) {
     console.error('PUT /matches/:id/participants', e);

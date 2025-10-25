@@ -1,6 +1,7 @@
 // app/controllers/tournament.js
 import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { getIO } from '../socket.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -262,7 +263,6 @@ async function recomputeTMatchScore(matchId) {
 }
 
 async function recalcTie(tieId) {
-  // победитель определяется по сумме голов всех FINISHED матчей пары
   const tie = await prisma.tournamentTie.findUnique({
     where: { id: tieId },
     select: { id: true, team1TTId: true, team2TTId: true },
@@ -281,7 +281,6 @@ async function recalcTie(tieId) {
   let agg1 = 0;
   let agg2 = 0;
   for (const m of matches) {
-    // голы считаем с точки зрения team1TT / team2TT в tie
     if (m.team1TTId === tie.team1TTId && m.team2TTId === tie.team2TTId) {
       agg1 += m.team1Score;
       agg2 += m.team2Score;
@@ -289,7 +288,6 @@ async function recalcTie(tieId) {
       agg1 += m.team2Score;
       agg2 += m.team1Score;
     } else {
-      // нестандарт — но тоже учитываем по принадлежности
       if (m.team1TTId === tie.team1TTId) agg1 += m.team1Score;
       if (m.team2TTId === tie.team1TTId) agg1 += m.team2Score;
       if (m.team1TTId === tie.team2TTId) agg2 += m.team1Score;
@@ -299,7 +297,6 @@ async function recalcTie(tieId) {
   let winnerTTId = null;
   if (agg1 > agg2) winnerTTId = tie.team1TTId;
   else if (agg2 > agg1) winnerTTId = tie.team2TTId;
-  // если равенство — оставляем null (решение пенальти можно проставить руками)
 
   const updated = await prisma.tournamentTie.update({
     where: { id: tieId },
@@ -309,6 +306,20 @@ async function recalcTie(tieId) {
       team2TT: { include: { team: true } },
     },
   });
+
+  // 🔔 sockets
+  const io = getIO();
+  io.to(`ttie:${updated.id}`).emit('tie:updated', {
+    ...updated,
+    aggregate: { team1: agg1, team2: agg2 },
+  });
+  io.to(
+    `tournament:${updated.team1TT.tournamentId || updated.team2TT.tournamentId || ''}`
+  ).emit('tie:updated', {
+    ...updated,
+    aggregate: { team1: agg1, team2: agg2 },
+  });
+
   return { ...updated, aggregate: { team1: agg1, team2: agg2 } };
 }
 
@@ -423,6 +434,10 @@ router.post('/tournaments', async (req, res) => {
         registrationDeadline: toDate(registrationDeadline, null),
       },
     });
+
+    // 🔔 sockets
+    getIO().emit('tournament:created', created);
+
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /tournaments', e);
@@ -459,6 +474,10 @@ router.patch('/tournaments/:id(\\d+)', async (req, res) => {
       where: { id },
       data: patch,
     });
+
+    // 🔔 sockets
+    getIO().to(`tournament:${id}`).emit('tournament:update', updated);
+
     res.json(updated);
   } catch (e) {
     console.error('PATCH /tournaments/:id', e);
@@ -475,6 +494,11 @@ router.delete('/tournaments/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     await prisma.tournament.delete({ where: { id } });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tournament:${id}`).emit('tournament:deleted', { tournamentId: id });
+
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /tournaments/:id', e);
@@ -487,16 +511,6 @@ router.delete('/tournaments/:id(\\d+)', async (req, res) => {
    ========================================================= */
 
 // POST /tournaments/:id/bracket/generate
-// body:
-// {
-//   mode?: "seed" | "random" | "explicit", // как формировать пары (по умолчанию "seed")
-//   pairs?: [[teamIdA, teamIdB], ...],     // для mode=explicit: Team.id (не TT)
-//   legs?: 1|2|3,                          // количество матчей в паре (по умолчанию 1)
-//   includeThirdPlace?: boolean,           // создать матч за 3-е место (пустая пара)
-//   createMatches?: boolean,               // сразу создать матчи (по 1 на leg)
-//   startDate?: "2025-10-19T12:00:00Z",    // дата для создаваемых матчей
-//   reset?: boolean                        // удалить старую сетку этих стадий перед генерацией (по умолчанию false)
-// }
 router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
   try {
     const tournamentId = Number(req.params.id);
@@ -520,9 +534,11 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
     const N = ttRows.length;
     const allowed = [2, 4, 8, 16, 32];
     if (!allowed.includes(N)) {
-      return res.status(400).json({
-        error: `Для генерации сетки нужно 2/4/8/16/32 команд (сейчас ${N})`,
-      });
+      return res
+        .status(400)
+        .json({
+          error: `Для генерации сетки нужно 2/4/8/16/32 команд (сейчас ${N})`,
+        });
     }
 
     const startStage = stageForTeamCount(N);
@@ -546,9 +562,11 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
         pairList.push([aTT, bTT]);
       }
       if (pairList.length * 2 !== N) {
-        return res.status(400).json({
-          error: 'Количество пар в pairs должно покрывать все команды',
-        });
+        return res
+          .status(400)
+          .json({
+            error: 'Количество пар в pairs должно покрывать все команды',
+          });
       }
     } else {
       // seed/random
@@ -571,13 +589,10 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
     }
 
     const created = await prisma.$transaction(async (tx) => {
-      // по желанию — очищаем старую сетку (и матчи) для этих стадий
       if (reset) {
-        // удалим матчи указанных стадий
         await tx.tournamentMatch.deleteMany({
           where: { tournamentId, round: { stage: { in: planStages } } },
         });
-        // удалим пары и сами раунды
         await tx.tournamentTie.deleteMany({
           where: { tournamentId, round: { stage: { in: planStages } } },
         });
@@ -586,7 +601,6 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
         });
       }
 
-      // создаём/получаем раунды
       const rounds = {};
       for (let i = 0; i < planStages.length; i++) {
         const st = planStages[i];
@@ -640,16 +654,12 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
         size = Math.max(1, Math.floor(size / 2));
         for (let k = 0; k < size; k++) {
           await tx.tournamentTie.create({
-            data: {
-              tournamentId,
-              roundId: rounds[st].id,
-              legs: 1,
-            },
+            data: { tournamentId, roundId: rounds[st].id, legs: 1 },
           });
         }
       }
 
-      // матч за 3-е место (пустая пара), если нужно и если стартовая стадия не финал
+      // матч за 3-е место (пустая пара)
       if (includeThirdPlace && startStage !== 'FINAL') {
         const third = await getOrCreateRound(
           tx,
@@ -668,7 +678,6 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
         }
       }
 
-      // вернём все пары по турниру
       const allTies = await tx.tournamentTie.findMany({
         where: { tournamentId },
         include: {
@@ -681,6 +690,13 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
 
       return { ties: allTies };
     });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tournament:${tournamentId}`).emit(
+      'tournament:bracket:generated',
+      created
+    );
 
     res.status(201).json({ success: true, ...created });
   } catch (e) {
@@ -732,6 +748,12 @@ router.post(
         update: { seed },
         create: { tournamentId, teamId, seed },
       });
+
+      // 🔔 sockets
+      getIO()
+        .to(`tournament:${tournamentId}`)
+        .emit('tournament:teams:updated', { type: 'attach', item: tt });
+
       res.status(201).json(tt);
     } catch (e) {
       console.error('attach tournament team', e);
@@ -750,6 +772,12 @@ router.delete(
       await prisma.tournamentTeam.delete({
         where: { tournamentId_teamId: { tournamentId, teamId } },
       });
+
+      // 🔔 sockets
+      getIO()
+        .to(`tournament:${tournamentId}`)
+        .emit('tournament:teams:updated', { type: 'detach', teamId });
+
       res.json({ success: true });
     } catch (e) {
       console.error('detach tournament team', e);
@@ -808,7 +836,6 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     });
     if (!tt) return res.status(404).json({ error: 'TournamentTeam не найден' });
 
-    // валидация принадлежности игроков команде
     for (const it of items) {
       const pid = Number(it.playerId);
       const p = await prisma.player.findUnique({
@@ -876,6 +903,11 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
       });
     });
 
+    // 🔔 sockets
+    getIO()
+      .to(`tournament:${tt.tournamentId}`)
+      .emit('troster:updated', { tournamentTeamId: id });
+
     res.json(result);
   } catch (e) {
     console.error('PUT /tournament-teams/:ttId/roster', e);
@@ -919,6 +951,12 @@ router.post('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
         notes: req.body.notes ?? null,
       },
     });
+
+    // 🔔 sockets
+    getIO()
+      .to(`tournament:${tt.tournamentId}`)
+      .emit('troster:updated', { tournamentTeamId: id });
+
     res.status(201).json(item);
   } catch (e) {
     console.error('POST /tournament-teams/:ttId/roster', e);
@@ -933,11 +971,23 @@ router.delete(
     try {
       const id = Number(req.params.ttId);
       const playerId = Number(req.params.playerId);
+      const tt = await prisma.tournamentTeam.findUnique({
+        where: { id },
+        select: { tournamentId: true },
+      });
+
       await prisma.tournamentTeamPlayer.delete({
         where: {
           tournamentTeamId_playerId: { tournamentTeamId: id, playerId },
         },
       });
+
+      // 🔔 sockets
+      if (tt)
+        getIO()
+          .to(`tournament:${tt.tournamentId}`)
+          .emit('troster:updated', { tournamentTeamId: id });
+
       res.json({ success: true });
     } catch (e) {
       console.error('DELETE /tournament-teams/:ttId/roster/:playerId', e);
@@ -970,6 +1020,17 @@ router.post('/tournament-teams/:ttId(\\d+)/captain', async (req, res) => {
       data: { captainRosterItemId: setId },
       include: { captainRosterItem: true },
     });
+
+    // 🔔 sockets
+    const tt = await prisma.tournamentTeam.findUnique({
+      where: { id },
+      select: { tournamentId: true },
+    });
+    if (tt)
+      getIO()
+        .to(`tournament:${tt.tournamentId}`)
+        .emit('troster:updated', { tournamentTeamId: id });
+
     res.json(updated);
   } catch (e) {
     console.error('POST /tournament-teams/:ttId/captain', e);
@@ -1045,6 +1106,13 @@ router.post('/tournament-teams/:ttId(\\d+)/publish', async (req, res) => {
       });
     });
 
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${m.id}`).emit('tparticipants:updated', rows);
+    io.to(`tournament:${m.tournamentId}`).emit('tparticipants:updated', {
+      matchId: m.id,
+    });
+
     res.json(rows);
   } catch (e) {
     console.error('POST /tournament-teams/:ttId/publish', e);
@@ -1071,17 +1139,13 @@ router.get('/tournaments/:id(\\d+)/rounds', async (req, res) => {
     res.status(500).json({ error: 'Ошибка загрузки раундов' });
   }
 });
-// POST /tournaments/:id/rounds
 router.post('/tournaments/:id(\\d+)/rounds', async (req, res) => {
   try {
     const tournamentId = Number(req.params.id);
     const { stage, name, number, date } = req.body || {};
-
-    if (!stage) {
+    if (!stage)
       return res.status(422).json({ error: 'Поле stage обязательно' });
-    }
 
-    // idempotent: если уже есть такой раунд — вернём его
     const exists = await prisma.tournamentRound.findFirst({
       where: {
         tournamentId,
@@ -1100,9 +1164,12 @@ router.post('/tournaments/:id(\\d+)/rounds', async (req, res) => {
         date: date ? new Date(date) : null,
       },
     });
+
+    // 🔔 sockets
+    getIO().to(`tournament:${tournamentId}`).emit('rounds:updated');
+
     res.status(201).json(created);
   } catch (e) {
-    // Prisma уникальность
     if (e?.code === 'P2002') {
       return res
         .status(409)
@@ -1126,6 +1193,14 @@ router.put('/tournament-rounds/:roundId(\\d+)', async (req, res) => {
         date: toDate(date, undefined),
       },
     });
+
+    // 🔔 sockets
+    const t = await prisma.tournamentRound.findUnique({
+      where: { id },
+      select: { tournamentId: true },
+    });
+    if (t) getIO().to(`tournament:${t.tournamentId}`).emit('rounds:updated');
+
     res.json(upd);
   } catch (e) {
     console.error('PUT /tournament-rounds/:roundId', e);
@@ -1135,7 +1210,15 @@ router.put('/tournament-rounds/:roundId(\\d+)', async (req, res) => {
 router.delete('/tournament-rounds/:roundId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.roundId);
+    const t = await prisma.tournamentRound.findUnique({
+      where: { id },
+      select: { tournamentId: true },
+    });
     await prisma.tournamentRound.delete({ where: { id } });
+
+    // 🔔 sockets
+    if (t) getIO().to(`tournament:${t.tournamentId}`).emit('rounds:updated');
+
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /tournament-rounds/:roundId', e);
@@ -1177,6 +1260,10 @@ router.post('/tournaments/:id(\\d+)/ties', async (req, res) => {
         legs: toInt(legs, 1),
       },
     });
+
+    // 🔔 sockets
+    getIO().to(`tournament:${tournamentId}`).emit('tie:updated', created);
+
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /tournaments/:id/ties', e);
@@ -1197,6 +1284,10 @@ router.put('/tournament-ties/:tieId(\\d+)', async (req, res) => {
         winnerTTId: toInt(winnerTTId, undefined),
       },
     });
+
+    // 🔔 sockets
+    getIO().to(`ttie:${id}`).emit('tie:updated', upd);
+
     res.json(upd);
   } catch (e) {
     console.error('PUT /tournament-ties/:tieId', e);
@@ -1216,7 +1307,18 @@ router.post('/tournament-ties/:tieId(\\d+)/recalc', async (req, res) => {
 router.delete('/tournament-ties/:tieId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.tieId);
+    const t = await prisma.tournamentTie.findUnique({
+      where: { id },
+      select: { tournamentId: true },
+    });
     await prisma.tournamentTie.delete({ where: { id } });
+
+    // 🔔 sockets
+    if (t)
+      getIO()
+        .to(`tournament:${t.tournamentId}`)
+        .emit('tie:updated', { deletedId: id });
+
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /tournament-ties/:tieId', e);
@@ -1331,7 +1433,6 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
           role: r.role ?? null,
         })),
       },
-      // обязательные связи — ТОЛЬКО через connect
       tournament: { connect: { id: Number(tournamentId) } },
       team1TT: { connect: { id: Number(team1TTId) } },
       team2TT: { connect: { id: Number(team2TTId) } },
@@ -1345,6 +1446,14 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       data,
       include: buildTMatchInclude('team1,team2,stadium,referees'),
     });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tournament:${tournamentId}`).emit('tmatch:created', created);
+    io.to(`tmatch:${created.id}`).emit('tmatch:update', created);
+    if (created.tieId)
+      io.to(`ttie:${created.tieId}`).emit('tmatch:created', created);
+
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /tournaments/:id/matches', e);
@@ -1387,8 +1496,16 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       where: { id },
       data: patch,
     });
-    // если финиш — можно пересчитать итог пары
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${id}`).emit('tmatch:update', upd);
+    io.to(`tournament:${upd.tournamentId}`).emit('tmatch:update', upd);
+    if (upd.tieId) io.to(`ttie:${upd.tieId}`).emit('tmatch:update', upd);
+
+    // если финиш — пересчитать итог пары
     if (patch.status === 'FINISHED' && upd.tieId) await recalcTie(upd.tieId);
+
     res.json(upd);
   } catch (e) {
     console.error('PATCH /tournament-matches/:matchId', e);
@@ -1404,7 +1521,24 @@ router.put('/tournament-matches/:matchId(\\d+)', (req, res) => {
 router.delete('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id },
+      select: { tournamentId: true, tieId: true },
+    });
     await prisma.tournamentMatch.delete({ where: { id } });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${id}`).emit('tmatch:deleted', { matchId: id });
+    if (m) {
+      io.to(`tournament:${m.tournamentId}`).emit('tmatch:deleted', {
+        matchId: id,
+      });
+      if (m.tieId)
+        io.to(`ttie:${m.tieId}`).emit('tmatch:deleted', { matchId: id });
+      io.in(`tmatch:${id}`).socketsLeave(`tmatch:${id}`);
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /tournament-matches/:matchId', e);
@@ -1420,6 +1554,15 @@ router.post('/tournament-matches/:matchId(\\d+)/start', async (req, res) => {
       where: { id },
       data: { status: 'LIVE' },
     });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${id}`).emit('tmatch:status', {
+      matchId: id,
+      status: 'LIVE',
+    });
+    io.to(`tournament:${upd.tournamentId}`).emit('tmatch:update', upd);
+
     res.json(upd);
   } catch (e) {
     console.error('POST /tournament-matches/:id/start', e);
@@ -1434,7 +1577,21 @@ router.post('/tournament-matches/:matchId(\\d+)/finish', async (req, res) => {
       where: { id },
       data: { status: 'FINISHED' },
     });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${id}`).emit('tmatch:status', {
+      matchId: id,
+      status: 'FINISHED',
+    });
+    io.to(`tmatch:${id}`).emit('tmatch:score', {
+      matchId: id,
+      team1Score: m.team1Score,
+      team2Score: m.team2Score,
+    });
+    io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', m);
     if (m.tieId) await recalcTie(m.tieId);
+
     res.json(m);
   } catch (e) {
     console.error('POST /tournament-matches/:id/finish', e);
@@ -1450,6 +1607,16 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
       where: { id },
       data: { team1Score, team2Score },
     });
+
+    // 🔔 sockets
+    const io = getIO();
+    io.to(`tmatch:${id}`).emit('tmatch:score', {
+      matchId: id,
+      team1Score,
+      team2Score,
+    });
+    io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', m);
+
     if (m.status === 'FINISHED' && m.tieId) await recalcTie(m.tieId);
     res.json(m);
   } catch (e) {
@@ -1497,6 +1664,20 @@ router.post('/tournament-matches/:matchId(\\d+)/referees', async (req, res) => {
       where: { matchId: id },
       include: { referee: true },
     });
+
+    // 🔔 sockets
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id },
+      select: { tournamentId: true },
+    });
+    if (m) {
+      const io = getIO();
+      io.to(`tmatch:${id}`).emit('treferees:updated', rows);
+      io.to(`tournament:${m.tournamentId}`).emit('treferees:updated', {
+        matchId: id,
+      });
+    }
+
     res.json(rows);
   } catch (e) {
     console.error('POST /tournament-matches/:id/referees', e);
@@ -1517,6 +1698,24 @@ router.post(
         update: { role },
         create: { matchId, refereeId, role },
       });
+
+      // 🔔 sockets
+      const rows = await prisma.tournamentMatchReferee.findMany({
+        where: { matchId },
+        include: { referee: true },
+      });
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id: matchId },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${matchId}`).emit('treferees:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('treferees:updated', {
+          matchId,
+        });
+      }
+
       res.json(row);
     } catch (e) {
       console.error('POST /tournament-matches/:id/referees/assign', e);
@@ -1533,6 +1732,24 @@ router.delete(
       await prisma.tournamentMatchReferee.delete({
         where: { matchId_refereeId: { matchId, refereeId } },
       });
+
+      // 🔔 sockets
+      const rows = await prisma.tournamentMatchReferee.findMany({
+        where: { matchId },
+        include: { referee: true },
+      });
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id: matchId },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${matchId}`).emit('treferees:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('treferees:updated', {
+          matchId,
+        });
+      }
+
       res.json({ success: true });
     } catch (e) {
       console.error('DELETE /tournament-matches/:id/referees/:refId', e);
@@ -1591,6 +1808,20 @@ router.put(
         where: { matchId: id },
         include: { tournamentTeamPlayer: { include: { player: true } } },
       });
+
+      // 🔔 sockets
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${id}`).emit('tparticipants:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('tparticipants:updated', {
+          matchId: id,
+        });
+      }
+
       res.json(rows);
     } catch (e) {
       console.error('PUT /tournament-matches/:id/participants', e);
@@ -1661,6 +1892,38 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       await incPlayerStatByRoster(created.assistRosterItemId, 'ASSIST');
     if (isGoalType(type)) await recomputeTMatchScore(matchId);
 
+    // 🔔 sockets
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: matchId },
+      select: {
+        id: true,
+        tournamentId: true,
+        tieId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    const io = getIO();
+    io.to(`tmatch:${matchId}`).emit('tevent:created', created);
+    if (m) {
+      io.to(`tmatch:${matchId}`).emit('tmatch:score', {
+        matchId,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', {
+        id: matchId,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      if (m.tieId)
+        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
+          id: matchId,
+          team1Score: m.team1Score,
+          team2Score: m.team2Score,
+        });
+    }
+
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /tournament-matches/:id/events', e);
@@ -1701,7 +1964,7 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
         tournamentTeamId: toInt(tournamentTeamId, undefined),
         rosterItemId: toInt(rosterItemId, null),
         assistRosterItemId: toInt(assistRosterItemId, null),
-        ssuedByRefereeId: toInt(issuedByRefereeId, undefined),
+        issuedByRefereeId: toInt(issuedByRefereeId, undefined),
       },
       include: {
         tournamentTeam: { include: { team: true } },
@@ -1717,6 +1980,38 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       await incPlayerStatByRoster(updated.assistRosterItemId, 'ASSIST');
     if (isGoalType(updated.type) || isGoalType(old.type))
       await recomputeTMatchScore(updated.matchId);
+
+    // 🔔 sockets
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: updated.matchId },
+      select: {
+        id: true,
+        tournamentId: true,
+        tieId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    const io = getIO();
+    io.to(`tmatch:${updated.matchId}`).emit('tevent:updated', updated);
+    if (m) {
+      io.to(`tmatch:${m.id}`).emit('tmatch:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', {
+        id: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      if (m.tieId)
+        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
+          id: m.id,
+          team1Score: m.team1Score,
+          team2Score: m.team2Score,
+        });
+    }
 
     res.json(updated);
   } catch (e) {
@@ -1738,6 +2033,41 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
     if (old.assistRosterItemId && old.type === 'GOAL')
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
     if (isGoalType(old.type)) await recomputeTMatchScore(old.matchId);
+
+    // 🔔 sockets
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: old.matchId },
+      select: {
+        id: true,
+        tournamentId: true,
+        tieId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+    });
+    const io = getIO();
+    io.to(`tmatch:${old.matchId}`).emit('tevent:deleted', {
+      id,
+      matchId: old.matchId,
+    });
+    if (m) {
+      io.to(`tmatch:${m.id}`).emit('tmatch:score', {
+        matchId: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', {
+        id: m.id,
+        team1Score: m.team1Score,
+        team2Score: m.team2Score,
+      });
+      if (m.tieId)
+        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
+          id: m.id,
+          team1Score: m.team1Score,
+          team2Score: m.team2Score,
+        });
+    }
 
     res.json({ success: true });
   } catch (e) {
