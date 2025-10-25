@@ -8,10 +8,10 @@ const prisma = new PrismaClient();
 async function main() {
   console.log('🌱 Сидим администратора...');
 
-  const passwordHash = await hash('123');
+  const passwordHash = await hash('!pjsd30jADSm2');
 
   const admin = await prisma.user.upsert({
-    where: { login: 'admin' }, // login уникален в схеме
+    where: { login: 'adminMLF' }, // login уникален в схеме
     update: {
       password: passwordHash,
       email: 'admin@test.com',
