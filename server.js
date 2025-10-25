@@ -4,8 +4,8 @@ import morgan from 'morgan';
 import cors from 'cors';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
-// import fs from 'fs';
-// import https from 'https';
+import fs from 'fs';
+import https from 'https';
 
 import http from 'http';
 import { errorHandler, notFound } from './app/middleware/error.middleware.js';
@@ -79,18 +79,18 @@ app.use(notFound);
 app.use(errorHandler);
 
 // --- HTTP + Socket.IO ---
-const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
-const server = http.createServer(app);
-initSocket(server);
-server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
+// const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+// const server = http.createServer(app);
+// initSocket(server);
+// server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
 
-/* --- Вариант HTTPS (если нужно):
 const sslOptions = {
-  key: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/privkey.pem'),
-  cert: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/cert.pem'),
-  ca: fs.readFileSync('/etc/letsencrypt/live/backend.fcnart.ru/chain.pem'),
+  key: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/privkey.pem'),
+  cert: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/cert.pem'),
+  ca: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/chain.pem'),
 };
 const httpsServer = https.createServer(sslOptions, app);
 initSocket(httpsServer);
-httpsServer.listen(443, () => console.log('Server is now running on https 443'));
-*/
+httpsServer.listen(443, () =>
+  console.log('Server is now running on https 443')
+);
