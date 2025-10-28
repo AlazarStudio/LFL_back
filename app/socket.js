@@ -31,13 +31,11 @@ export function initSocket(httpServer) {
       origin: [
         'http://localhost:5173',
         'http://127.0.0.1:5173',
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
         'https://mlf09.ru',
         'https://backend.mlf09.ru',
       ],
-      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      credentials: false, // ← если на клиенте withCredentials:false
+      methods: ['GET', 'POST'],
+      credentials: false, // если не используешь куки
     },
   });
 
