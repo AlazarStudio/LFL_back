@@ -79,18 +79,18 @@ app.use(notFound);
 app.use(errorHandler);
 
 // --- HTTP + Socket.IO ---
-const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
-const server = http.createServer(app);
-initSocket(server);
-server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
+// const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+// const server = http.createServer(app);
+// initSocket(server);
+// server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
 
-// const sslOptions = {
-//   key: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/privkey.pem'),
-//   cert: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/cert.pem'),
-//   ca: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/chain.pem'),
-// };
-// const httpsServer = https.createServer(sslOptions, app);
-// initSocket(httpsServer);
-// httpsServer.listen(443, () =>
-//   console.log('Server is now running on https 443')
-// );
+const sslOptions = {
+  key: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/privkey.pem'),
+  cert: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/cert.pem'),
+  ca: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/chain.pem'),
+};
+const httpsServer = https.createServer(sslOptions, app);
+initSocket(httpsServer);
+httpsServer.listen(443, () =>
+  console.log('Server is now running on https 443')
+);
