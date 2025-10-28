@@ -534,11 +534,9 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
     const N = ttRows.length;
     const allowed = [2, 4, 8, 16, 32];
     if (!allowed.includes(N)) {
-      return res
-        .status(400)
-        .json({
-          error: `Для генерации сетки нужно 2/4/8/16/32 команд (сейчас ${N})`,
-        });
+      return res.status(400).json({
+        error: `Для генерации сетки нужно 2/4/8/16/32 команд (сейчас ${N})`,
+      });
     }
 
     const startStage = stageForTeamCount(N);
@@ -562,11 +560,9 @@ router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
         pairList.push([aTT, bTT]);
       }
       if (pairList.length * 2 !== N) {
-        return res
-          .status(400)
-          .json({
-            error: 'Количество пар в pairs должно покрывать все команды',
-          });
+        return res.status(400).json({
+          error: 'Количество пар в pairs должно покрывать все команды',
+        });
       }
     } else {
       // seed/random
@@ -983,10 +979,11 @@ router.delete(
       });
 
       // 🔔 sockets
-      if (tt)
+      if (tt) {
         getIO()
           .to(`tournament:${tt.tournamentId}`)
           .emit('troster:updated', { tournamentTeamId: id });
+      }
 
       res.json({ success: true });
     } catch (e) {
@@ -1026,10 +1023,11 @@ router.post('/tournament-teams/:ttId(\\d+)/captain', async (req, res) => {
       where: { id },
       select: { tournamentId: true },
     });
-    if (tt)
+    if (tt) {
       getIO()
         .to(`tournament:${tt.tournamentId}`)
         .emit('troster:updated', { tournamentTeamId: id });
+    }
 
     res.json(updated);
   } catch (e) {
@@ -1314,10 +1312,11 @@ router.delete('/tournament-ties/:tieId(\\d+)', async (req, res) => {
     await prisma.tournamentTie.delete({ where: { id } });
 
     // 🔔 sockets
-    if (t)
+    if (t) {
       getIO()
         .to(`tournament:${t.tournamentId}`)
         .emit('tie:updated', { deletedId: id });
+    }
 
     res.json({ success: true });
   } catch (e) {
@@ -1916,12 +1915,13 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
         team1Score: m.team1Score,
         team2Score: m.team2Score,
       });
-      if (m.tieId)
+      if (m.tieId) {
         io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
           id: matchId,
           team1Score: m.team1Score,
           team2Score: m.team2Score,
         });
+      }
     }
 
     res.status(201).json(created);
@@ -2005,12 +2005,13 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
         team1Score: m.team1Score,
         team2Score: m.team2Score,
       });
-      if (m.tieId)
+      if (m.tieId) {
         io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
           id: m.id,
           team1Score: m.team1Score,
           team2Score: m.team2Score,
         });
+      }
     }
 
     res.json(updated);
@@ -2061,12 +2062,13 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
         team1Score: m.team1Score,
         team2Score: m.team2Score,
       });
-      if (m.tieId)
+      if (m.tieId) {
         io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
           id: m.id,
           team1Score: m.team1Score,
           team2Score: m.team2Score,
         });
+      }
     }
 
     res.json({ success: true });

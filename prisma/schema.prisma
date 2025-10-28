@@ -8,14 +8,16 @@ datasource db {
 }
 
 /**
- * ---------- ENUMS ----------
+ * =========================================================
+ * ENUMS (существующие + новые)
+ * =========================================================
  */
 
 enum RefereeRole {
-  MAIN // главный судья
-  AR1 // ассистент 1
-  AR2 // ассистент 2
-  FOURTH // 4-й арбитр
+  MAIN
+  AR1
+  AR2
+  FOURTH
   VAR
   AVAR
   OBSERVER
@@ -95,10 +97,19 @@ enum InvitationStatus {
 }
 
 /**
- * ---------- CORE: USERS / TEAMS / PLAYERS ----------
+ * ====== NEW ======
  */
+enum CardPeriod {
+  enum GroupType  { ROUND1 ROUND2 PLAYOFF }
+  enum SuspensionReason { YELLOWS RED }
 
-model User {
+  /**
+   * =========================================================
+   * CORE: USERS / TEAMS / PLAYERS
+   * =========================================================
+   */
+
+  model User {
   id              Int       @id @default(autoincrement())
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
@@ -111,9 +122,8 @@ model User {
   lastLoginAt     DateTime?
   player          Player?
 
-  // 👇 вместо двух одинаковых TeamInvite[]
-  invitesSent     TeamInvite[] @relation("InvitesSent") // кто отправил
-  invitesReceived TeamInvite[] @relation("InvitesReceived") // кого пригласили
+  invitesSent     TeamInvite[] @relation("InvitesSent")
+  invitesReceived TeamInvite[] @relation("InvitesReceived")
 
   @@index([role])
 }
@@ -138,7 +148,7 @@ model Team {
   standings      LeagueStanding[]
   TeamLineup     TeamLineup[]
   leagues        LeagueTeam[]
-  invites        TeamInvite[] // исходящие инвайты из команды
+  invites        TeamInvite[]
   TournamentTeam TournamentTeam[]
 }
 
@@ -165,12 +175,14 @@ model Player {
   playerMatches        PlayerMatch[]
   TeamLineupItem       TeamLineupItem[]
   LeagueTeamPlayer     LeagueTeamPlayer[]
-  invites              TeamInvite[]           @relation("InvitedPlayer") // входящие инвайты игроку
+  invites              TeamInvite[]           @relation("InvitedPlayer")
   TournamentTeamPlayer TournamentTeamPlayer[]
 }
 
 /**
- * ---------- LIGAS (чемпионаты, туры, матчи) ----------
+ * =========================================================
+ * LEAGUES (оставляем как есть, но не трогаем сейчас)
+ * =========================================================
  */
 
 model League {
@@ -414,7 +426,9 @@ model LeagueStanding {
 }
 
 /**
- * ---------- REF / NEWS / MEDIA ----------
+ * =========================================================
+ * REF / NEWS / MEDIA
+ * =========================================================
  */
 
 model Referee {
@@ -511,29 +525,48 @@ model Video {
 }
 
 /**
- * ---------- TOURNAMENTS (плей-офф) ----------
+ * =========================================================
+ * TOURNAMENTS (основная часть)
+ * =========================================================
  */
 
 model Tournament {
-  id                   Int       @id @default(autoincrement())
-  createdAt            DateTime  @default(now()) @map("created_at")
-  updatedAt            DateTime  @updatedAt @map("updated_at")
-  title                String
-  season               String?
-  city                 String?
-  images               String[]  @default([])
-  halfMinutes          Int       @default(45)
-  halves               Int       @default(2)
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  title     String
+  season    String?
+  city      String?
+  images    String[] @default([])
+
+  // формат и длительность
+  format      LeagueFormat @default(F11x11) // 5x5..11x11
+  halves      Int          @default(2)
+  halfMinutes Int          @default(45)
+
+  // даты
   startDate            DateTime? @default(now())
+  endDate              DateTime?
   registrationDeadline DateTime?
+
+  // дисциплина
+  disciplineEnabled       Boolean    @default(false)
+  disciplinePeriod        CardPeriod @default(TOURNAMENT)
+  yellowToSuspend         Int        @default(2)
+  redToSuspend            Int        @default(1)
+  suspendGames            Int        @default(1)
+  autoPublishParticipants Boolean    @default(true)
 
   teams   TournamentTeam[]
   rounds  TournamentRound[]
   ties    TournamentTie[]
   matches TournamentMatch[]
-  News    News[]
-  Photo   Photo[]
-  Video   Video[]
+  groups  TournamentGroup[]
+  susp    TournamentSuspension[]
+
+  News  News[]
+  Photo Photo[]
+  Video Video[]
 
   @@index([startDate])
 }
@@ -553,16 +586,13 @@ model TournamentTeam {
   captainRosterItemId Int?                  @unique
   captainRosterItem   TournamentTeamPlayer? @relation(name: "TournamentTeamCaptain", fields: [captainRosterItemId], references: [id])
 
-  // ✅ правильные обратные связи к TournamentTie
   tiesAsTeam1 TournamentTie[] @relation("TieTeam1")
   tiesAsTeam2 TournamentTie[] @relation("TieTeam2")
   wonTies     TournamentTie[] @relation("TieWinner")
 
-  // матчи
   matchesAsTeam1 TournamentMatch[] @relation("TMatchTeam1")
   matchesAsTeam2 TournamentMatch[] @relation("TMatchTeam2")
 
-  // события матча турнира (опционально)
   TournamentMatchEvent TournamentMatchEvent[]
 
   @@unique([tournamentId, teamId])
@@ -637,6 +667,40 @@ model TournamentTie {
   @@index([tournamentId, roundId])
 }
 
+model TournamentGroup {
+  id           Int        @id @default(autoincrement())
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  roundId Int?
+  round   TournamentRound? @relation(fields: [roundId], references: [id], onDelete: SetNull)
+
+  name String
+  type GroupType
+
+  teams   TournamentGroupTeam[]
+  matches TournamentMatch[]
+
+  @@index([tournamentId, roundId])
+}
+
+model TournamentGroupTeam {
+  id           Int        @id @default(autoincrement())
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  groupId Int
+  group   TournamentGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  tournamentTeamId Int
+  tournamentTeam   TournamentTeam @relation(fields: [tournamentTeamId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, tournamentTeamId])
+  @@index([tournamentId, groupId])
+}
+
 model TournamentMatch {
   id        Int         @id @default(autoincrement())
   createdAt DateTime    @default(now()) @map("created_at")
@@ -652,6 +716,9 @@ model TournamentMatch {
 
   tieId Int?
   tie   TournamentTie? @relation(fields: [tieId], references: [id], onDelete: SetNull)
+
+  groupId Int?
+  group   TournamentGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   team1TTId Int
   team1TT   TournamentTeam @relation("TMatchTeam1", fields: [team1TTId], references: [id], onDelete: Cascade)
@@ -674,7 +741,7 @@ model TournamentMatch {
   team1Coach     String?
   team2Coach     String?
 
-  @@index([tournamentId, roundId, tieId])
+  @@index([tournamentId, roundId, tieId, groupId])
   @@index([team1TTId, team2TTId])
 }
 
@@ -740,8 +807,33 @@ model TournamentPlayerMatch {
   @@index([matchId, role, order])
 }
 
+model TournamentSuspension {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tournamentId Int
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  tournamentTeamPlayerId Int
+  tournamentTeamPlayer   TournamentTeamPlayer @relation(fields: [tournamentTeamPlayerId], references: [id], onDelete: Cascade)
+
+  reason         SuspensionReason
+  startsAfter    DateTime?
+  remainingGames Int              @default(0)
+  isActive       Boolean          @default(true)
+
+  triggerMatchId Int?
+  triggerMatch   TournamentMatch? @relation(fields: [triggerMatchId], references: [id], onDelete: SetNull)
+
+  @@index([tournamentId, isActive])
+  @@index([tournamentTeamPlayerId, isActive])
+}
+
 /**
- * ---------- INVITES (приглашения в команду) ----------
+ * =========================================================
+ * INVITES
+ * =========================================================
  */
 
 model TeamInvite {
