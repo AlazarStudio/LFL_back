@@ -100,16 +100,29 @@ enum InvitationStatus {
  * ====== NEW ======
  */
 enum CardPeriod {
-  enum GroupType  { ROUND1 ROUND2 PLAYOFF }
-  enum SuspensionReason { YELLOWS RED }
+  TOURNAMENT
+  ROUND
+  GROUP
+}
 
-  /**
-   * =========================================================
-   * CORE: USERS / TEAMS / PLAYERS
-   * =========================================================
-   */
+enum GroupType {
+  ROUND1
+  ROUND2
+  PLAYOFF
+}
 
-  model User {
+enum SuspensionReason {
+  YELLOWS
+  RED
+}
+
+/**
+ * =========================================================
+ * CORE: USERS / TEAMS / PLAYERS
+ * =========================================================
+ */
+
+model User {
   id              Int       @id @default(autoincrement())
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
@@ -564,9 +577,10 @@ model Tournament {
   groups  TournamentGroup[]
   susp    TournamentSuspension[]
 
-  News  News[]
-  Photo Photo[]
-  Video Video[]
+  News                News[]
+  Photo               Photo[]
+  Video               Video[]
+  TournamentGroupTeam TournamentGroupTeam[]
 
   @@index([startDate])
 }
@@ -594,6 +608,7 @@ model TournamentTeam {
   matchesAsTeam2 TournamentMatch[] @relation("TMatchTeam2")
 
   TournamentMatchEvent TournamentMatchEvent[]
+  TournamentGroupTeam  TournamentGroupTeam[]
 
   @@unique([tournamentId, teamId])
   @@index([tournamentId, seed])
@@ -616,9 +631,10 @@ model TournamentTeamPlayer {
 
   captainOf TournamentTeam? @relation(name: "TournamentTeamCaptain")
 
-  matches      TournamentPlayerMatch[]
-  eventsMain   TournamentMatchEvent[]  @relation("TMainRosterItem")
-  eventsAssist TournamentMatchEvent[]  @relation("TAssistRosterItem")
+  matches              TournamentPlayerMatch[]
+  eventsMain           TournamentMatchEvent[]  @relation("TMainRosterItem")
+  eventsAssist         TournamentMatchEvent[]  @relation("TAssistRosterItem")
+  TournamentSuspension TournamentSuspension[]
 
   @@unique([tournamentTeamId, playerId])
   @@index([tournamentTeamId])
@@ -636,8 +652,9 @@ model TournamentRound {
   number Int?
   date   DateTime?
 
-  ties    TournamentTie[]
-  matches TournamentMatch[]
+  ties            TournamentTie[]
+  matches         TournamentMatch[]
+  TournamentGroup TournamentGroup[]
 
   @@unique([tournamentId, stage, number])
   @@index([tournamentId, stage, date])
@@ -736,10 +753,11 @@ model TournamentMatch {
   events       TournamentMatchEvent[]
   participants TournamentPlayerMatch[]
 
-  team1Formation String?
-  team2Formation String?
-  team1Coach     String?
-  team2Coach     String?
+  team1Formation       String?
+  team2Formation       String?
+  team1Coach           String?
+  team2Coach           String?
+  TournamentSuspension TournamentSuspension[]
 
   @@index([tournamentId, roundId, tieId, groupId])
   @@index([team1TTId, team2TTId])
