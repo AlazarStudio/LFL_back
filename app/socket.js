@@ -112,8 +112,9 @@ export function setMatchLineup(matchId, payload = {}) {
 
 /** Собрать из БД (participants + команды) и разослать */
 export async function emitLineupFromDB(prisma, matchId) {
+  const id = Number(matchId);
   const m = await prisma.tournamentMatch.findUnique({
-    where: { id: Number(matchId) },
+    where: { id },
     include: {
       participants: {
         include: {
@@ -130,29 +131,72 @@ export async function emitLineupFromDB(prisma, matchId) {
 
   const t1Id = m.team1TT?.id ?? null;
   const t2Id = m.team2TT?.id ?? null;
-  const cap1 = m.team1TT?.captainRosterItem?.id ?? null;
-  const cap2 = m.team2TT?.captainRosterItem?.id ?? null;
+  const cap1 =
+    m.team1TT?.captainRosterItem?.id ?? m.team1TT?.captainRosterItemId ?? null;
+  const cap2 =
+    m.team2TT?.captainRosterItem?.id ?? m.team2TT?.captainRosterItemId ?? null;
 
-  const t1 = [];
-  const t2 = [];
-  for (const p of m.participants) {
+  const fromParticipant = (p) => {
     const r = p.tournamentTeamPlayer;
-    const isT1 = r.tournamentTeamId === t1Id;
-    const isT2 = r.tournamentTeamId === t2Id;
-    const item = {
+    return {
       rosterItemId: r.id,
       playerId: r.playerId,
       name: r.player?.name ?? '',
       number: r.number ?? null,
       position: r.position ?? null,
       role: p.role ?? r.role ?? 'STARTER',
-      isCaptain: r.id === (isT1 ? cap1 : isT2 ? cap2 : null),
+      isCaptain:
+        r.id ===
+        (r.tournamentTeamId === t1Id
+          ? cap1
+          : r.tournamentTeamId === t2Id
+            ? cap2
+            : null),
     };
-    if (isT1) t1.push(item);
-    else if (isT2) t2.push(item);
+  };
+
+  // 1) Пытаемся собрать из participants
+  let t1 = [];
+  let t2 = [];
+  for (const p of m.participants ?? []) {
+    const r = p.tournamentTeamPlayer;
+    if (!r) continue;
+    if (r.tournamentTeamId === t1Id) t1.push(fromParticipant(p));
+    else if (r.tournamentTeamId === t2Id) t2.push(fromParticipant(p));
   }
 
-  setMatchLineup(matchId, {
+  // 2) Фоллбэк: если participants пустые — берём прямо из tournamentTeamPlayer
+  if (t1.length === 0 && t2.length === 0 && (t1Id || t2Id)) {
+    const [t1List, t2List] = await Promise.all([
+      t1Id
+        ? prisma.tournamentTeamPlayer.findMany({
+            where: { tournamentTeamId: t1Id },
+            include: { player: true },
+          })
+        : Promise.resolve([]),
+      t2Id
+        ? prisma.tournamentTeamPlayer.findMany({
+            where: { tournamentTeamId: t2Id },
+            include: { player: true },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const mapTTP = (r, cap) => ({
+      rosterItemId: r.id,
+      playerId: r.playerId,
+      name: r.player?.name ?? '',
+      number: r.number ?? null,
+      position: r.position ?? null,
+      role: r.role ?? 'STARTER',
+      isCaptain: r.id === cap,
+    });
+
+    t1 = t1List.map((r) => mapTTP(r, cap1));
+    t2 = t2List.map((r) => mapTTP(r, cap2));
+  }
+
+  setMatchLineup(id, {
     team1: {
       teamId: m.team1TT?.teamId ?? null,
       title: m.team1TT?.team?.title ?? '',
