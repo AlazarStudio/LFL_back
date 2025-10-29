@@ -76,6 +76,7 @@ const sanitizeList = (list = []) =>
 const sanitizeTeam = (t = {}) => ({
   teamId: toInt(t.teamId, null),
   title: String(t.title ?? ''),
+  smallTitle: typeof t.smallTitle === 'string' ? t.smallTitle.trim() : null,
   coach: String(t.coach ?? ''),
   formation: String(t.formation ?? ''),
   logo: t.logo ?? null, // строка (путь/URL) или null
@@ -200,6 +201,7 @@ export async function emitLineupFromDB(prisma, matchId) {
     team1: {
       teamId: m.team1TT?.teamId ?? null,
       title: m.team1TT?.team?.title ?? '',
+      smallTitle: m.team1TT?.team?.smallTitle ?? null,
       coach: m.team1Coach ?? '',
       formation: m.team1Formation ?? '',
       logo: m.team1TT?.team?.logo?.[0] ?? null,
@@ -208,6 +210,7 @@ export async function emitLineupFromDB(prisma, matchId) {
     team2: {
       teamId: m.team2TT?.teamId ?? null,
       title: m.team2TT?.team?.title ?? '',
+      smallTitle: m.team2TT?.team?.smallTitle ?? null,
       coach: m.team2Coach ?? '',
       formation: m.team2Formation ?? '',
       logo: m.team2TT?.team?.logo?.[0] ?? null,
