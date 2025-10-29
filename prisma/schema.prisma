@@ -553,7 +553,7 @@ model Tournament {
   images    String[] @default([])
 
   // формат и длительность
-  format      LeagueFormat @default(F11x11) // 5x5..11x11
+  format      LeagueFormat? @default(F11x11) // 5x5..11x11
   halves      Int          @default(2)
   halfMinutes Int          @default(45)
 
