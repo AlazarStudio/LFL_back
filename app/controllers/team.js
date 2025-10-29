@@ -15,6 +15,8 @@ const safeJSON = (v, fb) => {
 const toInt = (v) =>
   v === '' || v === null || v === undefined ? undefined : Number(v);
 
+const normStr = (v) => (typeof v === 'string' ? v.trim() : undefined);
+
 /* ===================== LIST ===================== */
 router.get('/', async (req, res) => {
   try {
@@ -40,11 +42,18 @@ router.get('/', async (req, res) => {
         title: { contains: filter.title.trim(), mode: 'insensitive' },
       });
     }
+    // фильтр по короткому названию
+    if (typeof filter.smallTitle === 'string' && filter.smallTitle.trim()) {
+      AND.push({
+        smallTitle: { contains: filter.smallTitle.trim(), mode: 'insensitive' },
+      });
+    }
     if (typeof filter.q === 'string' && filter.q.trim()) {
       const q = filter.q.trim();
       AND.push({
         OR: [
           { title: { contains: q, mode: 'insensitive' } },
+          { smallTitle: { contains: q, mode: 'insensitive' } },
           { city: { contains: q, mode: 'insensitive' } },
         ],
       });
@@ -94,12 +103,17 @@ router.get('/', async (req, res) => {
 
 /* ===== удобные доп. роуты (ВАЖНО: до "/:id") ===== */
 
-// поиск по точному title (без учёта регистра)
+// поиск по точному названию (title ИЛИ smallTitle, без учёта регистра)
 router.get('/by-title/:title', async (req, res) => {
   try {
     const { title } = req.params;
     const team = await prisma.team.findFirst({
-      where: { title: { equals: title, mode: 'insensitive' } },
+      where: {
+        OR: [
+          { title: { equals: title, mode: 'insensitive' } },
+          { smallTitle: { equals: title, mode: 'insensitive' } },
+        ],
+      },
     });
     if (!team) return res.status(404).json({ error: 'Команда не найдена' });
     res.json(team);
@@ -142,13 +156,12 @@ router.get('/:id/stats', async (req, res) => {
   }
 });
 
-
-
 /* ===================== CRUD ===================== */
 router.post('/', async (req, res) => {
   try {
     const {
       title,
+      smallTitle,
       city,
       logo = [],
       logoRaw = [],
@@ -177,6 +190,9 @@ router.post('/', async (req, res) => {
       images: finalImages,
     };
 
+    const st = normStr(smallTitle);
+    if (st) data.smallTitle = st;
+
     const games = toInt(req.body.games);
     const wins = toInt(req.body.wins);
     const goals = toInt(req.body.goals);
@@ -199,6 +215,7 @@ router.put('/:id', async (req, res) => {
     const id = Number(req.params.id);
     const {
       title,
+      smallTitle,
       city,
       logo = [],
       logoRaw = [],
@@ -225,6 +242,12 @@ router.put('/:id', async (req, res) => {
     if (city !== undefined) patch.city = city;
     if (logo.length || logoRaw.length) patch.logo = finalLogo;
     if (images.length || imagesRaw.length) patch.images = finalImages;
+
+    // позволяем и обновить, и очистить short name
+    if (smallTitle !== undefined) {
+      const st = normStr(smallTitle);
+      patch.smallTitle = st ?? null; // пустая строка → null
+    }
 
     const games = toInt(req.body.games);
     const wins = toInt(req.body.wins);
@@ -490,7 +513,6 @@ router.post('/:id/lineups/:lineupId/publish', async (req, res) => {
       select: { id: true, team1Id: true, team2Id: true },
     });
     if (!match) return res.status(404).json({ error: 'Матч не найден' });
-    // ✅ проверим, что эта команда участвует в матче
     if (![match.team1Id, match.team2Id].includes(teamId)) {
       return res
         .status(400)
