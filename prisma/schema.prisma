@@ -46,19 +46,10 @@ enum LineupRole {
 }
 
 enum FieldPosition {
-  GK
-  RB
-  CB
-  LB
-  RWB
-  LWB
-  DM
-  CM
-  AM
-  RW
-  LW
-  SS
-  ST
+  GK   // Вратарь
+  DEF  // Защитник
+  MID  // Полузащитник
+  FW   // Нападающий
 }
 
 enum UserRole {
@@ -146,6 +137,7 @@ model Team {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
   title       String
+  smallTitle  String?
   logo        String[] @default([])
   images      String[] @default([])
   city        String
@@ -554,8 +546,8 @@ model Tournament {
 
   // формат и длительность
   format      LeagueFormat? @default(F11x11) // 5x5..11x11
-  halves      Int          @default(2)
-  halfMinutes Int          @default(45)
+  halves      Int           @default(2)
+  halfMinutes Int           @default(45)
 
   // даты
   startDate            DateTime? @default(now())
