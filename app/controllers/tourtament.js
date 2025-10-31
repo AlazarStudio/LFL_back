@@ -158,45 +158,44 @@ async function getDefaultRefereeIdForMatch(matchId) {
 }
 
 /* -------------------- include builders -------------------- */
+// вместо прежних buildTournamentInclude / buildTMatchInclude
 const buildTournamentInclude = (p) => {
   const parts = String(p || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  return {
-    teams: parts.includes('teams')
-      ? {
-          include: {
-            team: true,
-            roster: parts.includes('roster')
-              ? { include: { player: true } }
-              : false,
-            captainRosterItem: !!parts.includes('roster'),
-          },
-        }
-      : false,
-    matches: parts.includes('matches')
-      ? {
-          include: {
-            team1TT: { include: { team: true } },
-            team2TT: { include: { team: true } },
-            stadiumRel: true,
-            referees: { include: { referee: true } },
-          },
-        }
-      : false,
-    groups:
-      parts.includes('groups') || parts.includes('stages')
-        ? {
-            include: {
-              teams: {
-                include: { tournamentTeam: { include: { team: true } } },
-              },
-              defaultReferee: true,
-            },
-          }
-        : false,
-  };
+
+  const inc = {};
+  if (parts.includes('teams')) {
+    inc.teams = {
+      include: {
+        team: true,
+        ...(parts.includes('roster') && {
+          roster: { include: { player: true } },
+          captainRosterItem: true,
+        }),
+      },
+    };
+  }
+  if (parts.includes('matches')) {
+    inc.matches = {
+      include: {
+        team1TT: { include: { team: true } },
+        team2TT: { include: { team: true } },
+        stadiumRel: true,
+        referees: { include: { referee: true } },
+      },
+    };
+  }
+  if (parts.includes('groups') || parts.includes('stages')) {
+    inc.groups = {
+      include: {
+        teams: { include: { tournamentTeam: { include: { team: true } } } },
+        defaultReferee: true,
+      },
+    };
+  }
+  return inc;
 };
 
 const buildTMatchInclude = (p) => {
@@ -204,28 +203,29 @@ const buildTMatchInclude = (p) => {
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  return {
-    tournament: !!parts.includes('tournament'),
-    group: !!parts.includes('group'),
-    team1TT: parts.includes('team1') ? { include: { team: true } } : false,
-    team2TT: parts.includes('team2') ? { include: { team: true } } : false,
-    stadiumRel: !!parts.includes('stadium'),
-    referees: parts.includes('referees')
-      ? { include: { referee: true } }
-      : false,
-    events: parts.includes('events')
-      ? {
-          include: {
-            rosterItem: { include: { player: true } },
-            assistRosterItem: { include: { player: true } },
-            tournamentTeam: { include: { team: true } },
-          },
-        }
-      : false,
-    participants: parts.includes('participants')
-      ? { include: { tournamentTeamPlayer: { include: { player: true } } } }
-      : false,
-  };
+
+  const inc = {};
+  if (parts.includes('tournament')) inc.tournament = true;
+  if (parts.includes('group')) inc.group = true;
+  if (parts.includes('team1')) inc.team1TT = { include: { team: true } };
+  if (parts.includes('team2')) inc.team2TT = { include: { team: true } };
+  if (parts.includes('stadium')) inc.stadiumRel = true;
+  if (parts.includes('referees')) inc.referees = { include: { referee: true } };
+  if (parts.includes('events')) {
+    inc.events = {
+      include: {
+        rosterItem: { include: { player: true } },
+        assistRosterItem: { include: { player: true } },
+        tournamentTeam: { include: { team: true } },
+      },
+    };
+  }
+  if (parts.includes('participants')) {
+    inc.participants = {
+      include: { tournamentTeamPlayer: { include: { player: true } } },
+    };
+  }
+  return inc;
 };
 
 /* -------------------- guards & asserts -------------------- */
