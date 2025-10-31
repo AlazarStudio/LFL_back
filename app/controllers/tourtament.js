@@ -2225,6 +2225,35 @@ router.get(
   '/tournament-matches/:matchId(\\d+)/participants',
   async (req, res) => {
     try {
+      // ДОБАВЬ в существующий GET /participants:
+      const flat = String(req.query.flat || 'false') === 'true';
+      if (flat) {
+        return res.json(
+          rows.map((r) => {
+            const p = r.tournamentTeamPlayer.player || {};
+            return {
+              id: r.id,
+              matchId: r.matchId,
+              ttId: r.tournamentTeamPlayer.tournamentTeamId,
+              playerId: r.tournamentTeamPlayer.playerId,
+              name: p.name || '',
+              role: r.role || 'STARTER',
+              isCaptain: !!r.isCaptain,
+              position:
+                r.position ??
+                r.tournamentTeamPlayer.position ??
+                p.position ??
+                null,
+              number:
+                r.order ?? r.tournamentTeamPlayer.number ?? p.number ?? null,
+              photo:
+                Array.isArray(p.images) && p.images.length ? p.images[0] : null,
+              photos: Array.isArray(p.images) ? p.images : [],
+            };
+          })
+        );
+      }
+
       const id = Number(req.params.matchId);
       const rows = await prisma.tournamentPlayerMatch.findMany({
         where: { matchId: id },
@@ -2455,9 +2484,11 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
 
 // рядом с participants/events
 // рядом с participants/events
+// рядом с participants/events
 router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
+
     const m = await prisma.tournamentMatch.findUnique({
       where: { id },
       select: { id: true, team1TTId: true, team2TTId: true },
@@ -2469,59 +2500,87 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
       where: { matchId: id },
       include: {
         tournamentTeamPlayer: {
-          include: { player: true, tournamentTeam: true },
+          include: {
+            player: true, // <— тут уже есть images, number, position (из профиля)
+            tournamentTeam: true,
+          },
         },
       },
       orderBy: [{ role: 'asc' }, { order: 'asc' }, { id: 'asc' }],
     });
 
-    // 2) фолбэк: формируем из заявки TT, если участников нет
+    // 2) возьмём капитанов TT на случай фолбэка (и пригодится для метки капитана)
+    const ttCaps = await prisma.tournamentTeam.findMany({
+      where: { id: { in: [m.team1TTId, m.team2TTId] } },
+      select: { id: true, captainRosterItemId: true },
+    });
+    const capMap = new Map(
+      ttCaps.map((t) => [t.id, t.captainRosterItemId || null])
+    );
+
+    // 3) фолбэк: если участников нет — строим из заявки TT
     if (!rows.length) {
-      const ttIds = [m.team1TTId, m.team2TTId]
-        .map(Number)
-        .filter(Number.isFinite);
+      const roster = await prisma.tournamentTeamPlayer.findMany({
+        where: { tournamentTeamId: { in: [m.team1TTId, m.team2TTId] } },
+        include: { player: true, tournamentTeam: true },
+        orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
+      });
 
-      if (ttIds.length) {
-        const roster = await prisma.tournamentTeamPlayer.findMany({
-          where: { tournamentTeamId: { in: ttIds } },
-          include: { player: true, tournamentTeam: true },
-          orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
-        });
-
-        rows = roster.map((r) => ({
-          matchId: id,
-          tournamentTeamPlayerId: r.id,
-          role: r.role || 'STARTER',
-          position: r.position || null,
-          isCaptain: false,
-          order: r.number ?? 0,
-          tournamentTeamPlayer: {
-            id: r.id,
-            number: r.number,
-            playerId: r.playerId,
-            player: r.player,
-            tournamentTeamId: r.tournamentTeamId,
-          },
-        }));
-      }
+      rows = roster.map((r) => ({
+        matchId: id,
+        tournamentTeamPlayerId: r.id,
+        role: r.role || 'STARTER',
+        position: r.position || null,
+        isCaptain: r.id === capMap.get(r.tournamentTeamId),
+        order: r.number ?? 0,
+        tournamentTeamPlayer: {
+          id: r.id,
+          number: r.number,
+          position: r.position,
+          playerId: r.playerId,
+          player: r.player, // есть .images[]
+          tournamentTeamId: r.tournamentTeamId,
+        },
+      }));
     }
 
+    // 4) удобный маппер под фронт: добавляем photo/photos, корректные position и number
     const toList = (ttId) =>
       rows
         .filter(
           (r) =>
             Number(r.tournamentTeamPlayer.tournamentTeamId) === Number(ttId)
         )
-        .map((r) => ({
-          rosterItemId: r.tournamentTeamPlayerId,
-          playerId: r.tournamentTeamPlayer.playerId,
-          name: r.tournamentTeamPlayer.player?.name || '',
-          number: r.tournamentTeamPlayer.number,
-          position: r.position || null,
-          role: r.role || 'STARTER',
-          isCaptain: !!r.isCaptain,
-          order: r.order ?? 0,
-        }));
+        .map((r) => {
+          const p = r.tournamentTeamPlayer.player || {};
+          const num =
+            r.order ?? // из участника (мы кладём туда номер)
+            r.tournamentTeamPlayer.number ?? // номер из заявки TT
+            p.number ?? // запасной номер из профиля игрока
+            null;
+
+          const pos =
+            r.position ?? // позиция из участника
+            r.tournamentTeamPlayer.position ?? // позиция из заявки TT
+            p.position ?? // позиция из профиля игрока
+            null;
+
+          return {
+            rosterItemId: r.tournamentTeamPlayerId,
+            playerId: r.tournamentTeamPlayer.playerId,
+            name: p.name || '',
+            number: num,
+            position: pos,
+            role: r.role || 'STARTER',
+            isCaptain:
+              !!r.isCaptain || r.tournamentTeamPlayerId === capMap.get(ttId),
+            order: num ?? 0,
+            // НОВОЕ:
+            photo:
+              Array.isArray(p.images) && p.images.length ? p.images[0] : null,
+            photos: Array.isArray(p.images) ? p.images : [],
+          };
+        });
 
     res.json({
       matchId: id,
