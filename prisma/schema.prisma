@@ -9,7 +9,7 @@ datasource db {
 
 /**
  * =========================================================
- * ENUMS (существующие + новые)
+ * ENUMS
  * =========================================================
  */
 
@@ -46,10 +46,10 @@ enum LineupRole {
 }
 
 enum FieldPosition {
-  GK   // Вратарь
-  DEF  // Защитник
-  MID  // Полузащитник
-  FW   // Нападающий
+  GK // Вратарь
+  DEF // Защитник
+  MID // Полузащитник
+  FW // Нападающий
 }
 
 enum UserRole {
@@ -71,6 +71,7 @@ enum LeagueFormat {
 }
 
 enum TournamentStage {
+  GROUP_STAGE
   ROUND_OF_32
   ROUND_OF_16
   QUARTERFINAL
@@ -186,7 +187,7 @@ model Player {
 
 /**
  * =========================================================
- * LEAGUES (оставляем как есть, но не трогаем сейчас)
+ * LEAGUES
  * =========================================================
  */
 
@@ -445,6 +446,7 @@ model Referee {
   TournamentMatchReferee TournamentMatchReferee[]
   MatchEvent             MatchEvent[]
   TournamentMatchEvent   TournamentMatchEvent[]
+  TournamentGroup        TournamentGroup[]
 }
 
 model Stadium {
@@ -531,7 +533,7 @@ model Video {
 
 /**
  * =========================================================
- * TOURNAMENTS (основная часть)
+ * TOURNAMENTS
  * =========================================================
  */
 
@@ -544,17 +546,14 @@ model Tournament {
   city      String?
   images    String[] @default([])
 
-  // формат и длительность
-  format      LeagueFormat? @default(F11x11) // 5x5..11x11
+  format      LeagueFormat? @default(F11x11)
   halves      Int           @default(2)
   halfMinutes Int           @default(45)
 
-  // даты
   startDate            DateTime? @default(now())
   endDate              DateTime?
   registrationDeadline DateTime?
 
-  // дисциплина
   disciplineEnabled       Boolean    @default(false)
   disciplinePeriod        CardPeriod @default(TOURNAMENT)
   yellowToSuspend         Int        @default(2)
@@ -563,15 +562,14 @@ model Tournament {
   autoPublishParticipants Boolean    @default(true)
 
   teams   TournamentTeam[]
-  rounds  TournamentRound[]
-  ties    TournamentTie[]
   matches TournamentMatch[]
   groups  TournamentGroup[]
   susp    TournamentSuspension[]
 
-  News                News[]
-  Photo               Photo[]
-  Video               Video[]
+  News  News[]
+  Photo Photo[]
+  Video Video[]
+
   TournamentGroupTeam TournamentGroupTeam[]
 
   @@index([startDate])
@@ -591,10 +589,6 @@ model TournamentTeam {
 
   captainRosterItemId Int?                  @unique
   captainRosterItem   TournamentTeamPlayer? @relation(name: "TournamentTeamCaptain", fields: [captainRosterItemId], references: [id])
-
-  tiesAsTeam1 TournamentTie[] @relation("TieTeam1")
-  tiesAsTeam2 TournamentTie[] @relation("TieTeam2")
-  wonTies     TournamentTie[] @relation("TieWinner")
 
   matchesAsTeam1 TournamentMatch[] @relation("TMatchTeam1")
   matchesAsTeam2 TournamentMatch[] @relation("TMatchTeam2")
@@ -632,79 +626,70 @@ model TournamentTeamPlayer {
   @@index([tournamentTeamId])
 }
 
-model TournamentRound {
-  id           Int        @id @default(autoincrement())
-  createdAt    DateTime   @default(now()) @map("created_at")
-  updatedAt    DateTime   @updatedAt @map("updated_at")
-  tournamentId Int
-  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+// model TournamentRound {
+//   id           Int        @id @default(autoincrement())
+//   createdAt    DateTime   @default(now()) @map("created_at")
+//   updatedAt    DateTime   @updatedAt @map("updated_at")
+//   tournamentId Int
+//   tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
 
-  stage  TournamentStage
-  name   String?
-  number Int?
-  date   DateTime?
+//   stage  TournamentStage
+//   name   String?
+//   number Int?
+//   date   DateTime?
 
-  ties            TournamentTie[]
-  matches         TournamentMatch[]
-  TournamentGroup TournamentGroup[]
+//   ties            TournamentTie[]
+//   matches         TournamentMatch[]
+//   TournamentGroup TournamentGroup[]
 
-  @@unique([tournamentId, stage, number])
-  @@index([tournamentId, stage, date])
-}
+//   @@unique([tournamentId, stage, number])
+//   @@index([tournamentId, stage, date])
+// }
 
-model TournamentTie {
-  id           Int             @id @default(autoincrement())
-  createdAt    DateTime        @default(now()) @map("created_at")
-  updatedAt    DateTime        @updatedAt @map("updated_at")
-  tournamentId Int
-  tournament   Tournament      @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
-  roundId      Int
-  round        TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+// model TournamentTie {
+//   id           Int             @id @default(autoincrement())
+//   createdAt    DateTime        @default(now()) @map("created_at")
+//   updatedAt    DateTime        @updatedAt @map("updated_at")
+//   tournamentId Int
+//   tournament   Tournament      @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+//   roundId      Int
+//   round        TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
 
-  team1TTId Int
-  team1TT   TournamentTeam @relation("TieTeam1", fields: [team1TTId], references: [id], onDelete: Cascade)
-  team2TTId Int
-  team2TT   TournamentTeam @relation("TieTeam2", fields: [team2TTId], references: [id], onDelete: Cascade)
+//   team1TTId Int
+//   team1TT   TournamentTeam @relation("TieTeam1", fields: [team1TTId], references: [id], onDelete: Cascade)
+//   team2TTId Int
+//   team2TT   TournamentTeam @relation("TieTeam2", fields: [team2TTId], references: [id], onDelete: Cascade)
 
-  legs Int @default(1)
+//   legs Int @default(1)
 
-  winnerTTId Int?
-  winnerTT   TournamentTeam? @relation("TieWinner", fields: [winnerTTId], references: [id], onDelete: SetNull)
+//   winnerTTId Int?
+//   winnerTT   TournamentTeam? @relation("TieWinner", fields: [winnerTTId], references: [id], onDelete: SetNull)
 
-  matches TournamentMatch[]
+//   matches TournamentMatch[]
 
-  @@index([tournamentId, roundId])
-}
+//   @@index([tournamentId, roundId])
+// }
 
 model TournamentGroup {
-  id           Int        @id @default(autoincrement())
-  createdAt    DateTime   @default(now()) @map("created_at")
-  updatedAt    DateTime   @updatedAt @map("updated_at")
-  tournamentId Int
-  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
-
-  roundId Int?
-  round   TournamentRound? @relation(fields: [roundId], references: [id], onDelete: SetNull)
-
-  name String
-  type GroupType
-
-  teams   TournamentGroupTeam[]
-  matches TournamentMatch[]
-
-  @@index([tournamentId, roundId])
+  id               Int                   @id @default(autoincrement())
+  tournamentId     Int
+  name             String?
+  type             GroupType             @default(ROUND1)
+  defaultRefereeId Int?
+  defaultReferee   Referee?              @relation(fields: [defaultRefereeId], references: [id], onDelete: SetNull)
+  matches          TournamentMatch[]
+  teams            TournamentGroupTeam[]
+  tournament       Tournament            @relation(fields: [tournamentId], references: [id])
 }
 
 model TournamentGroupTeam {
-  id           Int        @id @default(autoincrement())
-  tournamentId Int
-  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
-
-  groupId Int
-  group   TournamentGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
-
+  id               Int             @id @default(autoincrement())
+  tournamentId     Int
+  tournament       Tournament      @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  groupId          Int
+  group            TournamentGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
   tournamentTeamId Int
-  tournamentTeam   TournamentTeam @relation(fields: [tournamentTeamId], references: [id], onDelete: Cascade)
+  tournamentTeam   TournamentTeam  @relation(fields: [tournamentTeamId], references: [id], onDelete: Cascade)
 
   @@unique([groupId, tournamentTeamId])
   @@index([tournamentId, groupId])
@@ -719,12 +704,6 @@ model TournamentMatch {
 
   tournamentId Int
   tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
-
-  roundId Int
-  round   TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
-
-  tieId Int?
-  tie   TournamentTie? @relation(fields: [tieId], references: [id], onDelete: SetNull)
 
   groupId Int?
   group   TournamentGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
@@ -744,29 +723,34 @@ model TournamentMatch {
   referees     TournamentMatchReferee[]
   events       TournamentMatchEvent[]
   participants TournamentPlayerMatch[]
+  
 
-  team1Formation       String?
-  team2Formation       String?
-  team1Coach           String?
-  team2Coach           String?
+  team1Formation String?
+  team2Formation String?
+  team1Coach     String?
+  team2Coach     String?
+
+  // опциональные пометки для сеток/плейсхолдеров (можно оставить или удалить)
+  seriesKey String?
+  team1From String?
+  team2From String?
+
   TournamentSuspension TournamentSuspension[]
 
-  @@index([tournamentId, roundId, tieId, groupId])
+  @@index([tournamentId, groupId])
   @@index([team1TTId, team2TTId])
+  @@index([date])
+  @@index([status])
 }
 
 model TournamentMatchReferee {
-  id        Int          @id @default(autoincrement())
-  createdAt DateTime     @default(now()) @map("created_at")
-  updatedAt DateTime     @updatedAt @map("updated_at")
   matchId   Int
   refereeId Int
-  role      RefereeRole?
+  role      String?
+  match     TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  referee   Referee         @relation(fields: [refereeId], references: [id], onDelete: Cascade)
 
-  match   TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
-  referee Referee         @relation(fields: [refereeId], references: [id], onDelete: Cascade)
-
-  @@unique([matchId, refereeId])
+  @@unique([matchId, refereeId]) // чтобы upsert/skipDuplicates работали ожидаемо
 }
 
 model TournamentMatchEvent {

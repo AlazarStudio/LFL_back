@@ -17,6 +17,49 @@ const toInt = (v) =>
 
 const normStr = (v) => (typeof v === 'string' ? v.trim() : undefined);
 
+// Считает по ФАКТУ завершённых матчей (там, где оба счёта не null)
+async function computeTeamsStats(teamIds) {
+  if (!teamIds?.length) return new Map();
+
+  const matches = await prisma.match.findMany({
+    where: {
+      AND: [{ team1Score: { not: null } }, { team2Score: { not: null } }],
+      OR: [{ team1Id: { in: teamIds } }, { team2Id: { in: teamIds } }],
+    },
+    select: {
+      team1Id: true,
+      team2Id: true,
+      team1Score: true,
+      team2Score: true,
+    },
+  });
+
+  const stats = new Map(
+    teamIds.map((id) => [id, { games: 0, wins: 0, goals: 0 }])
+  );
+
+  for (const m of matches) {
+    const { team1Id, team2Id, team1Score = 0, team2Score = 0 } = m;
+
+    // для team1
+    if (stats.has(team1Id)) {
+      const s = stats.get(team1Id);
+      s.games += 1;
+      s.goals += Number(team1Score) || 0;
+      if (team1Score > team2Score) s.wins += 1;
+    }
+    // для team2
+    if (stats.has(team2Id)) {
+      const s = stats.get(team2Id);
+      s.games += 1;
+      s.goals += Number(team2Score) || 0;
+      if (team2Score > team1Score) s.wins += 1;
+    }
+  }
+
+  return stats;
+}
+
 /* ===================== LIST ===================== */
 router.get('/', async (req, res) => {
   try {

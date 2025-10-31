@@ -2,46 +2,18 @@
 import { Server } from 'socket.io';
 
 let io;
+let prismaRef = null;
 
 /* ===================== ХРАНИЛКИ СОСТОЯНИЙ ===================== */
 const clocks = new Map(); // matchId -> состояние часов
-const overlays = new Map(); // matchId -> флаги оверлеев (показов)
-const lineups = new Map(); // matchId -> составы команд (server-only)
+const overlays = new Map(); // matchId -> флаги оверлеев
+const lineups = new Map(); // matchId -> { team1:{ttId,list}, team2:{ttId,list} }
 
 /* ===================== УТИЛИТЫ ===================== */
-const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
+const nowMs = () => Date.now();
 
-/* ===================== НАСТРОЙКИ ОВЕРЛЕЕВ ===================== */
-const DEFAULT_FLAGS = {
-  OpenScore: false, // счет показать/убрать
-  OpenWaiting: false, // ожидание матча
-  OpenBreak: false, // перерыв между таймами
-  ShowSostavTeam1: false, // показать состав команды 1
-  ShowSostavTeam2: false, // показать состав команды 2
-  ShowPlug: false, // заглушка показать/убрать
-};
-const allowedKeys = new Set(Object.keys(DEFAULT_FLAGS));
-
-const makeOverlayDefault = (matchId) => ({
-  matchId: Number(matchId),
-  ...DEFAULT_FLAGS,
-  serverTimestamp: Date.now(),
-});
-const applyOverlayPatch = (matchId, patch = {}) => {
-  const id = Number(matchId);
-  const curr = overlays.get(id) || makeOverlayDefault(id);
-  const next = { ...curr };
-  for (const [k, v] of Object.entries(patch)) {
-    if (allowedKeys.has(k)) next[k] = !!v;
-  }
-  next.serverTimestamp = Date.now();
-  overlays.set(id, next);
-  return next;
-};
-
-/* ===================== ЧАСЫ МАТЧА ===================== */
 const normClock = (p) => {
-  const now = Date.now();
+  const now = nowMs();
   const halfMinutes = Number(p?.halfMinutes ?? 45);
   const half = Number(p?.half ?? 1);
   const baseElapsedSec = Math.max(0, Number(p?.baseElapsedSec ?? 0));
@@ -54,288 +26,210 @@ const normClock = (p) => {
     halfMinutes,
     baseElapsedSec,
     isPaused,
-    startedAt: isPaused ? null : now,
+    startedAt: isPaused ? null : now, // фиксируем момент старта/возобновления на сервере
     serverTimestamp: now,
-    addedSec: Math.max(0, Number(p?.addedSec ?? 0)), // «+X»
+    addedSec: Math.max(0, Number(p?.addedSec ?? 0)),
   };
 };
 
-/* ===================== СОСТАВЫ (SERVER-ONLY) ===================== */
-const pickPlayer = (p = {}) => ({
-  rosterItemId: toInt(p.rosterItemId, null), // id TournamentTeamPlayer
-  playerId: toInt(p.playerId, null),
-  name: String(p.name ?? ''),
-  number: toInt(p.number, null),
-  position: p.position ?? null, // FieldPosition
-  role: p.role ?? 'STARTER', // LineupRole
-  isCaptain: !!p.isCaptain,
-});
-const sanitizeList = (list = []) =>
-  (Array.isArray(list) ? list : []).map(pickPlayer);
-
-const sanitizeTeam = (t = {}) => ({
-  teamId: toInt(t.teamId, null),
-  title: String(t.title ?? ''),
-  smallTitle: typeof t.smallTitle === 'string' ? t.smallTitle.trim() : null,
-  coach: String(t.coach ?? ''),
-  formation: String(t.formation ?? ''),
-  logo: t.logo ?? null, // строка (путь/URL) или null
-  list: sanitizeList(t.list),
-});
-
-const makeLineupDefault = (matchId) => ({
-  matchId: Number(matchId),
-  team1: sanitizeTeam(),
-  team2: sanitizeTeam(),
-  serverTimestamp: Date.now(),
-});
-
-const ensureLineup = (matchId) => {
-  const id = Number(matchId);
-  if (!lineups.has(id)) lineups.set(id, makeLineupDefault(id));
-  return lineups.get(id);
-};
-
-/** Записать составы и разослать (вызывать только с бэка) */
-export function setMatchLineup(matchId, payload = {}) {
-  const id = Number(matchId);
-  if (!id || !io) return;
-  const prev = ensureLineup(id);
-  const next = {
-    matchId: id,
-    team1: payload.team1 ? sanitizeTeam(payload.team1) : prev.team1,
-    team2: payload.team2 ? sanitizeTeam(payload.team2) : prev.team2,
-    serverTimestamp: Date.now(),
-  };
-  lineups.set(id, next);
-  io.to(`tmatch:${id}`).emit('tmatch:lineup', next);
-}
-
-/** Собрать из БД (participants + команды) и разослать */
-export async function emitLineupFromDB(prisma, matchId) {
+/* ===================== ЛАЙНАП И ЧАСЫ ИЗ БД ===================== */
+async function buildLineupFromDB(prisma, matchId) {
   const id = Number(matchId);
   const m = await prisma.tournamentMatch.findUnique({
     where: { id },
+    select: {
+      id: true,
+      tournamentId: true,
+      team1TTId: true,
+      team2TTId: true,
+    },
+  });
+  if (!m) return null;
+
+  // 1) Из участников матча
+  let rows = await prisma.tournamentPlayerMatch.findMany({
+    where: { matchId: id },
     include: {
-      participants: {
-        include: {
-          tournamentTeamPlayer: {
-            include: { player: true, tournamentTeam: true },
-          },
-        },
+      tournamentTeamPlayer: {
+        include: { player: true, tournamentTeam: true },
       },
-      team1TT: { include: { team: true, captainRosterItem: true } },
-      team2TT: { include: { team: true, captainRosterItem: true } },
     },
+    orderBy: [{ role: 'asc' }, { order: 'asc' }, { id: 'asc' }],
   });
-  if (!m) return;
 
-  const t1Id = m.team1TT?.id ?? null;
-  const t2Id = m.team2TT?.id ?? null;
-  const cap1 =
-    m.team1TT?.captainRosterItem?.id ?? m.team1TT?.captainRosterItemId ?? null;
-  const cap2 =
-    m.team2TT?.captainRosterItem?.id ?? m.team2TT?.captainRosterItemId ?? null;
-
-  const fromParticipant = (p) => {
-    const r = p.tournamentTeamPlayer;
-    return {
-      rosterItemId: r.id,
-      playerId: r.playerId,
-      name: r.player?.name ?? '',
-      number: r.number ?? null,
-      position: r.position ?? null,
-      role: p.role ?? r.role ?? 'STARTER',
-      isCaptain:
-        r.id ===
-        (r.tournamentTeamId === t1Id
-          ? cap1
-          : r.tournamentTeamId === t2Id
-            ? cap2
-            : null),
-    };
-  };
-
-  // 1) Пытаемся собрать из participants
-  let t1 = [];
-  let t2 = [];
-  for (const p of m.participants ?? []) {
-    const r = p.tournamentTeamPlayer;
-    if (!r) continue;
-    if (r.tournamentTeamId === t1Id) t1.push(fromParticipant(p));
-    else if (r.tournamentTeamId === t2Id) t2.push(fromParticipant(p));
-  }
-
-  // 2) Фоллбэк: если participants пустые — берём прямо из tournamentTeamPlayer
-  if (t1.length === 0 && t2.length === 0 && (t1Id || t2Id)) {
-    const [t1List, t2List] = await Promise.all([
-      t1Id
-        ? prisma.tournamentTeamPlayer.findMany({
-            where: { tournamentTeamId: t1Id },
-            include: { player: true },
-          })
-        : Promise.resolve([]),
-      t2Id
-        ? prisma.tournamentTeamPlayer.findMany({
-            where: { tournamentTeamId: t2Id },
-            include: { player: true },
-          })
-        : Promise.resolve([]),
-    ]);
-
-    const mapTTP = (r, cap) => ({
-      rosterItemId: r.id,
-      playerId: r.playerId,
-      name: r.player?.name ?? '',
-      number: r.number ?? null,
-      position: r.position ?? null,
-      role: r.role ?? 'STARTER',
-      isCaptain: r.id === cap,
+  // 2) Фолбэк: из заявки TT
+  if (!rows.length) {
+    const roster = await prisma.tournamentTeamPlayer.findMany({
+      where: { tournamentTeamId: { in: [m.team1TTId, m.team2TTId] } },
+      include: { player: true },
+      orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
     });
-
-    t1 = t1List.map((r) => mapTTP(r, cap1));
-    t2 = t2List.map((r) => mapTTP(r, cap2));
+    rows = roster.map((r) => ({
+      matchId: id,
+      tournamentTeamPlayerId: r.id,
+      role: r.role || 'STARTER',
+      position: r.position || null,
+      isCaptain: false,
+      order: r.number ?? 0,
+      tournamentTeamPlayer: {
+        id: r.id,
+        number: r.number,
+        playerId: r.playerId,
+        player: r.player,
+        tournamentTeamId: r.tournamentTeamId,
+      },
+    }));
   }
 
-  setMatchLineup(id, {
-    team1: {
-      teamId: m.team1TT?.teamId ?? null,
-      title: m.team1TT?.team?.title ?? '',
-      smallTitle: m.team1TT?.team?.smallTitle ?? null,
-      coach: m.team1Coach ?? '',
-      formation: m.team1Formation ?? '',
-      logo: m.team1TT?.team?.logo?.[0] ?? null,
-      list: t1,
-    },
-    team2: {
-      teamId: m.team2TT?.teamId ?? null,
-      title: m.team2TT?.team?.title ?? '',
-      smallTitle: m.team2TT?.team?.smallTitle ?? null,
-      coach: m.team2Coach ?? '',
-      formation: m.team2Formation ?? '',
-      logo: m.team2TT?.team?.logo?.[0] ?? null,
-      list: t2,
-    },
-  });
+  const toList = (ttId) =>
+    rows
+      .filter((r) => r.tournamentTeamPlayer.tournamentTeamId === ttId)
+      .map((r) => ({
+        rosterItemId: r.tournamentTeamPlayerId,
+        playerId: r.tournamentTeamPlayer.playerId,
+        name: r.tournamentTeamPlayer.player?.name || '',
+        number: r.tournamentTeamPlayer.number,
+        position: r.position || null,
+        role: r.role || 'STARTER',
+        isCaptain: !!r.isCaptain,
+        order: r.order ?? 0,
+      }));
+
+  return {
+    matchId: id,
+    team1: { ttId: m.team1TTId, list: toList(m.team1TTId) },
+    team2: { ttId: m.team2TTId, list: toList(m.team2TTId) },
+  };
 }
 
-/* ===================== ИНИЦИАЛИЗАЦИЯ SOCKET.IO ===================== */
-export function initSocket(httpServer) {
+async function buildDefaultClockFromDB(matchId) {
+  const id = Number(matchId);
+  let halfMinutes = 45;
+  if (prismaRef) {
+    const m = await prismaRef.tournamentMatch.findUnique({
+      where: { id },
+      select: { tournament: { select: { halfMinutes: true } } },
+    });
+    halfMinutes = Number(m?.tournament?.halfMinutes ?? 45);
+  }
+  // Пауза в 1-м тайме, 0:00
+  return {
+    matchId: id,
+    phase: 'H1',
+    half: 1,
+    halfMinutes,
+    baseElapsedSec: 0,
+    isPaused: true,
+    startedAt: null,
+    serverTimestamp: Date.now(),
+    addedSec: 0,
+  };
+}
+
+/* =========================================================
+   ПУБЛИЧНЫЕ API ДЛЯ СЕРВЕРА
+========================================================= */
+export function initSocket(httpServer, { prisma } = {}) {
+  prismaRef = prisma || null;
+
   io = new Server(httpServer, {
     path: '/socket.io',
     cors: {
-      origin: [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-        'https://mlf09.ru',
-        'https://backend.mlf09.ru',
-      ],
-      methods: ['GET', 'POST'],
+      origin: '*',
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       credentials: false,
     },
   });
 
   io.on('connection', (socket) => {
-    /* ===== Общие комнаты ===== */
-    socket.on('room:join', (room) => room && socket.join(room));
-    socket.on('room:leave', (room) => room && socket.leave(room));
-
-    /* ===== Совместимость с существующей логикой ===== */
-    socket.on('join', ({ matchId, tournamentId, tieId }) => {
-      if (matchId) {
-        socket.join(`tmatch:${matchId}`);
-        // отдать текущее состояние часов/оверлеев/составов
-        const clk = clocks.get(Number(matchId));
-        if (clk) socket.emit('tmatch:clock', clk);
-
-        const ov = overlays.get(Number(matchId)) || makeOverlayDefault(matchId);
-        overlays.set(Number(matchId), ov);
-        socket.emit('tmatch:overlay', ov);
-
-        const lu = ensureLineup(matchId);
-        socket.emit('tmatch:lineup', lu);
+    /* ====== Комнаты ====== */
+    socket.on('room:join', (room, ack) => {
+      try {
+        if (room) socket.join(room);
+        ack && ack({ ok: true, room });
+      } catch (e) {
+        ack && ack({ ok: false, error: String(e) });
       }
-      if (tournamentId) socket.join(`tournament:${tournamentId}`);
-      if (tieId) socket.join(`ttie:${tieId}`);
     });
 
-    socket.on('leave', ({ matchId, tournamentId, tieId }) => {
-      if (matchId) socket.leave(`tmatch:${matchId}`);
-      if (tournamentId) socket.leave(`tournament:${tournamentId}`);
-      if (tieId) socket.leave(`ttie:${tieId}`);
+    socket.on('room:leave', (room) => {
+      try {
+        if (room) socket.leave(room);
+      } catch {}
     });
 
-    /* ===== ЧАСЫ ===== */
-    socket.on('tmatch:clock:set', (payload) => {
-      if (!payload?.matchId) return;
-      const state = normClock(payload);
-      clocks.set(state.matchId, state);
-      io.to(`tmatch:${state.matchId}`).emit('tmatch:clock', state);
-    });
-    socket.on('tmatch:clock:get', ({ matchId }) => {
-      const st = clocks.get(Number(matchId));
-      if (st) socket.emit('tmatch:clock', st);
-    });
-
-    /* ===== ОВЕРЛЕИ ===== */
-    socket.on('tmatch:overlay:set', (payload = {}) => {
-      const id = Number(payload.matchId);
-      if (!id) return;
-      const st = applyOverlayPatch(id, payload);
-      io.to(`tmatch:${id}`).emit('tmatch:overlay', st);
-    });
-    socket.on('tmatch:overlay:get', ({ matchId }) => {
+    /* ====== Часы ====== */
+    socket.on('tmatch:clock:get', async ({ matchId }, ack) => {
       const id = Number(matchId);
-      if (!id) return;
-      const st = overlays.get(id) || makeOverlayDefault(id);
-      overlays.set(id, st);
-      socket.emit('tmatch:overlay', st);
-    });
-    socket.on('tmatch:overlay:toggle', ({ matchId, key }) => {
-      const id = Number(matchId);
-      if (!id || !allowedKeys.has(key)) return;
-      const curr = overlays.get(id) || makeOverlayDefault(id);
-      const st = applyOverlayPatch(id, { [key]: !curr[key] });
-      io.to(`tmatch:${id}`).emit('tmatch:overlay', st);
-    });
-    socket.on('tmatch:overlay:reset', ({ matchId }) => {
-      const id = Number(matchId);
-      if (!id) return;
-      const st = makeOverlayDefault(id);
-      overlays.set(id, st);
-      io.to(`tmatch:${id}`).emit('tmatch:overlay', st);
+      let st = clocks.get(id);
+      if (!st) {
+        st = await buildDefaultClockFromDB(id);
+        clocks.set(id, st);
+      }
+      if (st) {
+        ack && ack(st); // вернуть текущее состояние в ACK
+        socket.emit('tmatch:clock', st); // и продублировать событием
+      }
     });
 
-    /* ===== СОСТАВЫ (READ-ONLY ДЛЯ КЛИЕНТА) ===== */
-    // Клиент может только запросить текущее состояние:
-    socket.on('tmatch:lineup:get', ({ matchId }) => {
-      const lu = ensureLineup(matchId);
-      socket.emit('tmatch:lineup', lu);
+    socket.on('tmatch:clock:set', (patch, ack) => {
+      try {
+        const id = Number(patch?.matchId);
+        if (!id) throw new Error('matchId required');
+        const next = setClock(id, patch); // нормализует и пошлёт в комнату
+        ack && ack(next);
+      } catch (e) {
+        ack && ack({ error: String(e) });
+      }
     });
-    // Обновлять составы через сокет с клиента — запрещено (нет handler'ов).
+
+    /* ====== Составы ====== */
+    socket.on('tmatch:lineup:get', async ({ matchId }) => {
+      const id = Number(matchId);
+      let lu = lineups.get(id);
+      if (!lu && prismaRef) {
+        lu = await buildLineupFromDB(prismaRef, id);
+        if (lu) lineups.set(id, lu);
+      }
+      if (lu) socket.emit('tmatch:lineup', lu);
+    });
   });
 
   return io;
 }
 
-export const getIO = () => io;
+export function getIO() {
+  if (!io) throw new Error('Socket.io is not initialized');
+  return io;
+}
 
-/* ===================== ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ (бэк) ===================== */
-/*
-import { setMatchLineup, emitLineupFromDB } from './app/socket.js';
+/* ===== часы ===== */
+export function setClock(matchId, statePatch) {
+  const id = Number(matchId);
+  const prev = clocks.get(id);
+  const next = normClock({ matchId: id, ...prev, ...statePatch });
+  clocks.set(id, next);
+  getIO().to(`tmatch:${id}`).emit('tmatch:clock', next);
+  return next;
+}
 
-// 1) После публикации участников матча:
-await emitLineupFromDB(prisma, matchId);
+/* ===== оверлеи ===== */
+export function setOverlayFlags(matchId, patch) {
+  const id = Number(matchId);
+  const prev = overlays.get(id) || {};
+  const next = { ...prev, ...patch };
+  overlays.set(id, next);
+  getIO().to(`tmatch:${id}`).emit('tmatch:overlay', next);
+  return next;
+}
 
-// 2) Или если у тебя уже есть данные:
-setMatchLineup(matchId, {
-  team1: {
-    teamId, title, coach, formation, logo,
-    list: [
-      { rosterItemId, playerId, name, number, position: 'CB', role: 'STARTER', isCaptain: true },
-      // ...
-    ]
-  },
-  team2: { ... }
-});
-*/
+/* ===== лайнапы: публичная функция для роутов ===== */
+export async function emitLineupFromDB(prisma, matchId) {
+  const payload = await buildLineupFromDB(prisma, matchId);
+  if (!payload) return null;
+  lineups.set(Number(matchId), payload);
+  getIO()
+    .to(`tmatch:${Number(matchId)}`)
+    .emit('tmatch:lineup', payload);
+  return payload;
+}

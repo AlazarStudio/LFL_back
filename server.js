@@ -6,8 +6,8 @@ import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import https from 'https';
-
 import http from 'http';
+
 import { errorHandler, notFound } from './app/middleware/error.middleware.js';
 import { prisma } from './app/prisma.js';
 
@@ -48,11 +48,12 @@ app.use((req, res, next) => {
   res.header('Access-Control-Expose-Headers', 'Content-Range');
   next();
 });
+
 if (process.env.NODE_ENV === 'development') app.use(morgan('dev'));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, '/uploads')));
 
-// API routes
+/* ===================== ROUTES ===================== */
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/teams', teamController);
@@ -78,19 +79,23 @@ app.use('/api/leagues', leagueExportRouter);
 app.use(notFound);
 app.use(errorHandler);
 
-// --- HTTP + Socket.IO ---
+/* ===================== HTTP + SOCKET.IO ===================== */
 // const PORT = process.env.PORT ? Number(process.env.PORT) : 5000;
+
 // const server = http.createServer(app);
-// initSocket(server);
+// // ВАЖНО: передаём prisma в сокеты
+// initSocket(server, { prisma });
+
 // server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
 
+/* ===== HTTPS (при необходимости) ===== */
 const sslOptions = {
   key: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/privkey.pem'),
   cert: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/cert.pem'),
   ca: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/chain.pem'),
 };
 const httpsServer = https.createServer(sslOptions, app);
-initSocket(httpsServer);
+initSocket(httpsServer, { prisma });
 httpsServer.listen(443, () =>
   console.log('Server is now running on https 443')
 );

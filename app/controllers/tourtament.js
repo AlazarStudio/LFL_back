@@ -1,3 +1,5 @@
+// app/routes/tournaments.js
+
 import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { getIO, emitLineupFromDB } from '../socket.js';
@@ -8,6 +10,89 @@ const prisma = new PrismaClient();
 /* =========================================================
    helpers
 ========================================================= */
+
+const FIN = 'FINISHED';
+const isFinished = (s) => String(s).toUpperCase() === String(FIN).toUpperCase();
+
+/* ---------- totals: игры/победы/голы/кол-во турниров у команды ---------- */
+async function recalcTeamTotals(teamId) {
+  // все заявки этой команды в турнирах
+  const tts = await prisma.tournamentTeam.findMany({
+    where: { teamId },
+    select: { id: true, tournamentId: true },
+  });
+
+  const tournamentsCount = tts.length;
+
+  if (!tts.length) {
+    await prisma.team.update({
+      where: { id: teamId },
+      data: {
+        games: 0,
+        wins: 0,
+        goals: 0,
+        tournaments: 0,
+      },
+    });
+    return;
+  }
+
+  const ttIds = tts.map((t) => t.id);
+
+  // все завершённые матчи с участием этих заявок
+  const matches = await prisma.tournamentMatch.findMany({
+    where: {
+      status: 'FINISHED',
+      OR: [{ team1TTId: { in: ttIds } }, { team2TTId: { in: ttIds } }],
+    },
+    select: {
+      team1TTId: true,
+      team2TTId: true,
+      team1Score: true,
+      team2Score: true,
+    },
+  });
+
+  let games = 0;
+  let wins = 0;
+  let goals = 0;
+  for (const m of matches) {
+    const isT1 = ttIds.includes(m.team1TTId);
+    const gf = isT1 ? (m.team1Score ?? 0) : (m.team2Score ?? 0);
+    const ga = isT1 ? (m.team2Score ?? 0) : (m.team1Score ?? 0);
+    games += 1;
+    goals += gf;
+    if (gf > ga) wins += 1;
+  }
+
+  await prisma.team.update({
+    where: { id: teamId },
+    data: {
+      games,
+      wins,
+      goals,
+      tournaments: tournamentsCount,
+    },
+  });
+}
+
+// вызывать пересчёт только если матч уже FINISHED
+async function recalcTotalsIfFinished(matchId) {
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id: matchId },
+    select: {
+      status: true,
+      team1TT: { select: { team: { select: { id: true } } } },
+      team2TT: { select: { team: { select: { id: true } } } },
+    },
+  });
+  if (!m || !isFinished(m.status)) return;
+  await Promise.all([
+    recalcTeamTotals(m.team1TT.team.id),
+    recalcTeamTotals(m.team2TT.team.id),
+  ]);
+}
+
 const safeJSON = (v, fb) => {
   try {
     return v ? JSON.parse(String(v)) : fb;
@@ -18,10 +103,9 @@ const safeJSON = (v, fb) => {
 const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
 const toDate = (v, d = undefined) => (v ? new Date(v) : d);
 const setRange = (res, name, start, count, total) => {
-  res.setHeader(
-    'Content-Range',
-    `${name} ${start}-${start + count - 1}/${total}`
-  );
+  const from = total === 0 ? 0 : start;
+  const to = total === 0 ? 0 : start + Math.max(0, count - 1);
+  res.setHeader('Content-Range', `${name} ${from}-${to}/${total}`);
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
 const toStrArr = (val) => {
@@ -43,55 +127,34 @@ const STARTERS_BY_FORMAT = {
   F11x11: 11,
 };
 
-/* ---------- bracket helpers (только генерация) ---------- */
-const STAGE_ORDER = [
-  'ROUND_OF_32',
-  'ROUND_OF_16',
-  'QUARTERFINAL',
-  'SEMIFINAL',
-  'FINAL',
-];
-
-function stageForTeamCount(n) {
-  switch (n) {
-    case 32:
-      return 'ROUND_OF_32';
-    case 16:
-      return 'ROUND_OF_16';
-    case 8:
-      return 'QUARTERFINAL';
-    case 4:
-      return 'SEMIFINAL';
-    case 2:
-      return 'FINAL';
-    default:
-      return null;
-  }
-}
-
-async function getOrCreateRound(
-  tx,
-  tournamentId,
-  stage,
-  number = null,
-  name = null,
-  date = null
-) {
-  let round = await tx.tournamentRound.findFirst({
-    where: { tournamentId, stage },
+/* ---------- default match referee helper (MAIN first) ---------- */
+async function getDefaultRefereeIdForMatch(matchId) {
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id: matchId },
+    select: { groupId: true },
   });
-  if (!round) {
-    round = await tx.tournamentRound.create({
-      data: {
-        tournamentId,
-        stage,
-        number,
-        name,
-        date,
-      },
+  if (!m) return null;
+
+  if (m.groupId) {
+    const g = await prisma.tournamentGroup.findUnique({
+      where: { id: m.groupId },
+      select: { defaultRefereeId: true },
     });
+    if (g?.defaultRefereeId) return g.defaultRefereeId;
   }
-  return round;
+
+  // сначала ищем MAIN; если нет — любого
+  const main = await prisma.tournamentMatchReferee.findFirst({
+    where: { matchId, role: 'MAIN' },
+    orderBy: { matchId: 'asc' },
+  });
+  if (main) return main.refereeId;
+
+  const any = await prisma.tournamentMatchReferee.findFirst({
+    where: { matchId },
+    orderBy: { matchId: 'asc' },
+  });
+  return any?.refereeId ?? null;
 }
 
 /* -------------------- include builders -------------------- */
@@ -112,15 +175,6 @@ const buildTournamentInclude = (p) => {
           },
         }
       : false,
-    rounds: !!parts.includes('rounds'),
-    ties: parts.includes('ties')
-      ? {
-          include: {
-            team1TT: { include: { team: true } },
-            team2TT: { include: { team: true } },
-          },
-        }
-      : false,
     matches: parts.includes('matches')
       ? {
           include: {
@@ -131,13 +185,17 @@ const buildTournamentInclude = (p) => {
           },
         }
       : false,
-    groups: parts.includes('groups')
-      ? {
-          include: {
-            teams: { include: { tournamentTeam: { include: { team: true } } } },
-          },
-        }
-      : false,
+    groups:
+      parts.includes('groups') || parts.includes('stages')
+        ? {
+            include: {
+              teams: {
+                include: { tournamentTeam: { include: { team: true } } },
+              },
+              defaultReferee: true,
+            },
+          }
+        : false,
   };
 };
 
@@ -148,8 +206,6 @@ const buildTMatchInclude = (p) => {
     .filter(Boolean);
   return {
     tournament: !!parts.includes('tournament'),
-    round: !!parts.includes('round'),
-    tie: !!parts.includes('tie'),
     group: !!parts.includes('group'),
     team1TT: parts.includes('team1') ? { include: { team: true } } : false,
     team2TT: parts.includes('team2') ? { include: { team: true } } : false,
@@ -189,6 +245,26 @@ async function assertRosterItemBelongs(rosterItemId, tournamentTeamId) {
   if (!it) throw new Error('Игрок-заявка не найдена');
   if (it.tournamentTeamId !== tournamentTeamId)
     throw new Error('Игрок не принадлежит этой заявке');
+}
+
+/* ---------- normalize match for frontend ---------- */
+function normalizeMatch(m) {
+  if (!m) return m;
+  const stadium = m.stadiumRel || null;
+  const stadiumTitle = stadium?.title || stadium?.name || null;
+  const refs = Array.isArray(m.referees) ? m.referees : [];
+  const mainRel = refs.find((r) => r.role === 'MAIN') || refs[0] || null;
+  const referee = mainRel?.referee || null;
+  const refereeId = referee?.id ?? null;
+  const refereeName = referee?.name ?? null;
+  return {
+    ...m,
+    stadium,
+    stadiumTitle,
+    referee,
+    refereeId,
+    refereeName,
+  };
 }
 
 /* -------------------- stats helpers (global PlayerStat) -------------------- */
@@ -235,7 +311,7 @@ async function decPlayerStatByRoster(rosterItemId, type) {
   });
 }
 
-/* -------------------- scoring & tie logic -------------------- */
+/* -------------------- scoring -------------------- */
 async function recomputeTMatchScore(matchId) {
   await prisma.$transaction(async (tx) => {
     const grouped = await tx.tournamentMatchEvent.groupBy({
@@ -260,66 +336,6 @@ async function recomputeTMatchScore(matchId) {
   });
 }
 
-async function recalcTie(tieId) {
-  const tie = await prisma.tournamentTie.findUnique({
-    where: { id: tieId },
-    select: { id: true, team1TTId: true, team2TTId: true },
-  });
-  if (!tie) return null;
-
-  const matches = await prisma.tournamentMatch.findMany({
-    where: { tieId, status: 'FINISHED' },
-    select: {
-      team1TTId: true,
-      team2TTId: true,
-      team1Score: true,
-      team2Score: true,
-    },
-  });
-  let agg1 = 0;
-  let agg2 = 0;
-  for (const m of matches) {
-    if (m.team1TTId === tie.team1TTId && m.team2TTId === tie.team2TTId) {
-      agg1 += m.team1Score;
-      agg2 += m.team2Score;
-    } else if (m.team1TTId === tie.team2TTId && m.team2TTId === tie.team1TTId) {
-      agg1 += m.team2Score;
-      agg2 += m.team1Score;
-    } else {
-      if (m.team1TTId === tie.team1TTId) agg1 += m.team1Score;
-      if (m.team2TTId === tie.team1TTId) agg1 += m.team2Score;
-      if (m.team1TTId === tie.team2TTId) agg2 += m.team1Score;
-      if (m.team2TTId === tie.team2TTId) agg2 += m.team2Score;
-    }
-  }
-  let winnerTTId = null;
-  if (agg1 > agg2) winnerTTId = tie.team1TTId;
-  else if (agg2 > agg1) winnerTTId = tie.team2TTId;
-
-  const updated = await prisma.tournamentTie.update({
-    where: { id: tieId },
-    data: { winnerTTId },
-    include: {
-      team1TT: { include: { team: true } },
-      team2TT: { include: { team: true } },
-    },
-  });
-
-  const io = getIO();
-  io.to(`ttie:${updated.id}`).emit('tie:updated', {
-    ...updated,
-    aggregate: { team1: agg1, team2: agg2 },
-  });
-  io.to(
-    `tournament:${updated.team1TT.tournamentId || updated.team2TT.tournamentId || ''}`
-  ).emit('tie:updated', {
-    ...updated,
-    aggregate: { team1: agg1, team2: agg2 },
-  });
-
-  return { ...updated, aggregate: { team1: agg1, team2: agg2 } };
-}
-
 /* =========================================================
    DISCIPLINE (дисквалификации)
 ========================================================= */
@@ -337,10 +353,10 @@ async function getDisciplineSettings(tournamentId) {
   });
 }
 
-// подсчёт карточек по периоду (TOURNAMENT/ROUND/GROUP)
+// period=ROUND трактуем как groupId (раунды отключены)
 async function countCardsScoped({ tournamentId, rosterItemId, period, match }) {
   const whereMatch = { tournamentId };
-  if (period === 'ROUND') whereMatch.roundId = match.roundId ?? undefined;
+  if (period === 'ROUND') whereMatch.groupId = match.groupId ?? undefined;
   if (period === 'GROUP') whereMatch.groupId = match.groupId ?? undefined;
 
   const baseWhere = { rosterItemId, match: whereMatch };
@@ -357,14 +373,12 @@ async function countCardsScoped({ tournamentId, rosterItemId, period, match }) {
 }
 
 async function maybeCreateSuspensionAfterEvent(createdEvent) {
-  // нужен матчик для периода
   const m = await prisma.tournamentMatch.findUnique({
     where: { id: createdEvent.matchId },
     select: {
       id: true,
       date: true,
       tournamentId: true,
-      roundId: true,
       groupId: true,
     },
   });
@@ -450,7 +464,7 @@ async function serveSuspensionsAfterMatch(matchId) {
 }
 
 /* =========================================================
-   AUTOPUBLISH roster → participants (с учётом банов)
+   AUTOPUBLISH roster → participants (учёт банов)
 ========================================================= */
 async function publishRosterToMatch(matchId, ttId, roleFilter = 'ALL') {
   const m = await prisma.tournamentMatch.findUnique({
@@ -465,12 +479,23 @@ async function publishRosterToMatch(matchId, ttId, roleFilter = 'ALL') {
   });
   if (!m) throw new Error('Матч не найден');
 
+  if (![m.team1TTId, m.team2TTId].includes(ttId))
+    throw new Error('Команда не участвует в этом матче');
+
   const tt = await prisma.tournamentTeam.findUnique({
     where: { id: ttId },
-    select: { id: true, tournamentId: true, captainRosterItemId: true },
+    select: {
+      id: true,
+      tournamentId: true,
+      captainRosterItemId: true,
+      tournament: { select: { format: true } },
+    },
   });
   if (!tt || tt.tournamentId !== m.tournamentId)
     throw new Error('Команда не из турнира матча');
+
+  const maxStarters =
+    STARTERS_BY_FORMAT[tt.tournament?.format || 'F11x11'] ?? 11;
 
   const roster = await prisma.tournamentTeamPlayer.findMany({
     where: {
@@ -480,6 +505,7 @@ async function publishRosterToMatch(matchId, ttId, roleFilter = 'ALL') {
     orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
   });
 
+  // вычтем баны
   const susp = await prisma.tournamentSuspension.findMany({
     where: {
       tournamentId: m.tournamentId,
@@ -492,22 +518,34 @@ async function publishRosterToMatch(matchId, ttId, roleFilter = 'ALL') {
   });
   const banned = new Set(susp.map((s) => s.tournamentTeamPlayerId));
 
-  const allowed = roster.filter((r) => !banned.has(r.id));
-  if (!allowed.length) return [];
+  let allowed = roster.filter((r) => !banned.has(r.id));
+  if (roleFilter === 'STARTER' && allowed.length > maxStarters) {
+    allowed = allowed.slice(0, maxStarters);
+  }
 
-  await prisma.tournamentPlayerMatch.createMany({
-    data: allowed.map((r) => ({
+  // полное удаление участников этой команды в матче
+  await prisma.tournamentPlayerMatch.deleteMany({
+    where: {
       matchId: m.id,
-      tournamentTeamPlayerId: r.id,
-      role: r.role ?? 'STARTER',
-      position: r.position ?? null,
-      isCaptain: tt.captainRosterItemId
-        ? r.id === tt.captainRosterItemId
-        : false,
-      order: r.number != null ? r.number : 0,
-    })),
-    skipDuplicates: true,
+      tournamentTeamPlayer: { tournamentTeamId: ttId },
+    },
   });
+
+  if (allowed.length) {
+    await prisma.tournamentPlayerMatch.createMany({
+      data: allowed.map((r) => ({
+        matchId: m.id,
+        tournamentTeamPlayerId: r.id,
+        role: r.role ?? 'STARTER',
+        position: r.position ?? null,
+        isCaptain: tt.captainRosterItemId
+          ? r.id === tt.captainRosterItemId
+          : false,
+        order: r.number != null ? r.number : 0,
+      })),
+      skipDuplicates: true,
+    });
+  }
 
   return allowed.map((a) => a.id);
 }
@@ -582,9 +620,7 @@ router.get('/tournaments', async (req, res) => {
 router.get('/tournaments/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const include = buildTournamentInclude(
-      req.query.include || 'teams,rounds,ties,groups'
-    );
+    const include = buildTournamentInclude(req.query.include || 'teams,groups');
     const item = await prisma.tournament.findUnique({ where: { id }, include });
     if (!item) return res.status(404).json({ error: 'Турнир не найден' });
     res.json(item);
@@ -711,194 +747,28 @@ router.put('/tournaments/:id(\\d+)', (req, res) => {
 router.delete('/tournaments/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
+
+    // сохраним команды, чтобы пересчитать после удаления турнира
+    const teamIds = await prisma.tournamentTeam
+      .findMany({
+        where: { tournamentId: id },
+        select: { teamId: true },
+      })
+      .then((x) => Array.from(new Set(x.map((r) => r.teamId))));
+
     await prisma.tournament.delete({ where: { id } });
+
+    // пересчёт totals тем, кто участвовал в этом турнире
+    if (teamIds.length) {
+      await Promise.all(teamIds.map((tid) => recalcTeamTotals(tid)));
+    }
+
     const io = getIO();
     io.to(`tournament:${id}`).emit('tournament:deleted', { tournamentId: id });
     res.json({ success: true });
   } catch (e) {
     console.error('DELETE /tournaments/:id', e);
     res.status(500).json({ error: 'Ошибка удаления турнира' });
-  }
-});
-
-/* =========================================================
-   BRACKET GENERATION (без авто-проставления)
-========================================================= */
-router.post('/tournaments/:id(\\d+)/bracket/generate', async (req, res) => {
-  try {
-    const tournamentId = Number(req.params.id);
-    const {
-      mode = 'seed',
-      pairs = [],
-      legs = 1,
-      includeThirdPlace = false,
-      createMatches = false,
-      startDate = null,
-      reset = false,
-    } = req.body || {};
-
-    const ttRows = await prisma.tournamentTeam.findMany({
-      where: { tournamentId },
-      include: { team: true },
-      orderBy: [{ seed: 'asc' }, { id: 'asc' }],
-    });
-
-    const N = ttRows.length;
-    const allowed = [2, 4, 8, 16, 32];
-    if (!allowed.includes(N)) {
-      return res.status(400).json({
-        error: `Для генерации сетки нужно 2/4/8/16/32 команд (сейчас ${N})`,
-      });
-    }
-
-    const startStage = stageForTeamCount(N);
-    const startIdx = STAGE_ORDER.indexOf(startStage);
-    const planStages = STAGE_ORDER.slice(startIdx);
-
-    const pairList = [];
-    if (mode === 'explicit') {
-      const teamIdToTT = new Map(ttRows.map((r) => [r.teamId, r.id]));
-      for (const [a, b] of pairs) {
-        const aTT = teamIdToTT.get(Number(a));
-        const bTT = teamIdToTT.get(Number(b));
-        if (!aTT || !bTT) {
-          return res
-            .status(400)
-            .json({ error: 'pairs содержит команду, не заявленную в турнире' });
-        }
-        pairList.push([aTT, bTT]);
-      }
-      if (pairList.length * 2 !== N) {
-        return res.status(400).json({
-          error: 'Количество пар в pairs должно покрывать все команды',
-        });
-      }
-    } else {
-      let ordered = ttRows.slice();
-      if (mode === 'random') {
-        ordered = ordered.sort(() => Math.random() - 0.5);
-      } else {
-        ordered = ordered.sort((a, b) => {
-          const sa = a.seed ?? 999999;
-          const sb = b.seed ?? 999999;
-          if (sa !== sb) return sa - sb;
-          return (a.team.title || '').localeCompare(b.team.title || '');
-        });
-      }
-      for (let i = 0; i < N / 2; i++)
-        pairList.push([ordered[i].id, ordered[N - 1 - i].id]);
-    }
-
-    const created = await prisma.$transaction(async (tx) => {
-      if (reset) {
-        await tx.tournamentMatch.deleteMany({
-          where: { tournamentId, round: { stage: { in: planStages } } },
-        });
-        await tx.tournamentTie.deleteMany({
-          where: { tournamentId, round: { stage: { in: planStages } } },
-        });
-        await tx.tournamentRound.deleteMany({
-          where: { tournamentId, stage: { in: planStages } },
-        });
-      }
-
-      const rounds = {};
-      for (let i = 0; i < planStages.length; i++) {
-        const st = planStages[i];
-        rounds[st] = await getOrCreateRound(
-          tx,
-          tournamentId,
-          st,
-          i + 1,
-          st.replaceAll('_', ' ')
-        );
-      }
-
-      const startRound = rounds[startStage];
-      const tiesCreated = [];
-      for (const [tt1, tt2] of pairList) {
-        const tie = await tx.tournamentTie.create({
-          data: {
-            tournamentId,
-            roundId: startRound.id,
-            team1TTId: tt1,
-            team2TTId: tt2,
-            legs: Number(legs) || 1,
-          },
-        });
-        tiesCreated.push(tie);
-
-        if (createMatches) {
-          const L = Number(legs) || 1;
-          for (let leg = 1; leg <= L; leg++) {
-            await tx.tournamentMatch.create({
-              data: {
-                date: startDate ? new Date(startDate) : new Date(),
-                status: 'SCHEDULED',
-                legNumber: leg,
-                tournament: { connect: { id: tournamentId } },
-                round: { connect: { id: startRound.id } },
-                tie: { connect: { id: tie.id } },
-                team1TT: { connect: { id: tt1 } },
-                team2TT: { connect: { id: tt2 } },
-              },
-            });
-          }
-        }
-      }
-
-      let size = pairList.length;
-      for (let i = startIdx + 1; i < STAGE_ORDER.length; i++) {
-        const st = STAGE_ORDER[i];
-        size = Math.max(1, Math.floor(size / 2));
-        for (let k = 0; k < size; k++) {
-          await tx.tournamentTie.create({
-            data: { tournamentId, roundId: rounds[st].id, legs: 1 },
-          });
-        }
-      }
-
-      if (includeThirdPlace && startStage !== 'FINAL') {
-        const third = await getOrCreateRound(
-          tx,
-          tournamentId,
-          'THIRD_PLACE',
-          null,
-          '3rd place'
-        );
-        const exists = await tx.tournamentTie.findFirst({
-          where: { tournamentId, roundId: third.id },
-        });
-        if (!exists) {
-          await tx.tournamentTie.create({
-            data: { tournamentId, roundId: third.id, legs: 1 },
-          });
-        }
-      }
-
-      const allTies = await tx.tournamentTie.findMany({
-        where: { tournamentId },
-        include: {
-          round: true,
-          team1TT: { include: { team: true } },
-          team2TT: { include: { team: true } },
-        },
-        orderBy: [{ roundId: 'asc' }, { id: 'asc' }],
-      });
-      return { ties: allTies };
-    });
-
-    const io = getIO();
-    io.to(`tournament:${tournamentId}`).emit(
-      'tournament:bracket:generated',
-      created
-    );
-    res.status(201).json({ success: true, ...created });
-  } catch (e) {
-    console.error('POST /tournaments/:id/bracket/generate', e);
-    res
-      .status(400)
-      .json({ error: e.message || 'Не удалось сгенерировать сетку' });
   }
 });
 
@@ -935,11 +805,19 @@ router.post(
       const tournamentId = Number(req.params.id);
       const teamId = Number(req.params.teamId);
       const seed = toInt(req.body?.seed, null);
+
+      // проверим, что команда существует
+      const team = await prisma.team.findUnique({ where: { id: teamId } });
+      if (!team) return res.status(404).json({ error: 'Команда не найдена' });
+
       const tt = await prisma.tournamentTeam.upsert({
         where: { tournamentId_teamId: { tournamentId, teamId } },
         update: { seed },
         create: { tournamentId, teamId, seed },
       });
+
+      // ← пересчёт totals: турниры++ (по заявкам), игры/голы не меняются
+      await recalcTeamTotals(teamId);
 
       getIO()
         .to(`tournament:${tournamentId}`)
@@ -961,6 +839,9 @@ router.delete(
       await prisma.tournamentTeam.delete({
         where: { tournamentId_teamId: { tournamentId, teamId } },
       });
+
+      // ← пересчёт totals: уменьшится количество турниров
+      await recalcTeamTotals(teamId);
 
       getIO()
         .to(`tournament:${tournamentId}`)
@@ -1020,7 +901,7 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     });
     if (!tt) return res.status(404).json({ error: 'TournamentTeam не найден' });
 
-    // проверка, что все игроки из команды
+    // валидация «игрок из этой команды»
     for (const it of items) {
       const pid = Number(it.playerId);
       const p = await prisma.player.findUnique({
@@ -1039,7 +920,6 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
         return res.status(400).json({ error: 'Капитан не из этой команды' });
     }
 
-    // лимит стартеров по формату турнира
     const maxStarters =
       STARTERS_BY_FORMAT[tt.tournament.format || 'F11x11'] ?? 11;
     const startersCount = items.filter(
@@ -1078,12 +958,10 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
           (await tx.tournamentTeamPlayer.findFirst({
             where: { tournamentTeamId: id, playerId: captainPlayerId },
           }));
-        if (cap) {
-          await tx.tournamentTeam.update({
-            where: { id },
-            data: { captainRosterItemId: cap.id },
-          });
-        }
+        await tx.tournamentTeam.update({
+          where: { id },
+          data: { captainRosterItemId: cap ? cap.id : null },
+        });
       } else {
         await tx.tournamentTeam.update({
           where: { id },
@@ -1130,7 +1008,6 @@ router.post('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     if (!p || p.teamId !== tt.teamId)
       return res.status(400).json({ error: 'Игрок не из этой команды' });
 
-    // если добавляем STARTER — проверим лимит
     if ((req.body.role ?? 'STARTER') === 'STARTER') {
       const maxStarters =
         STARTERS_BY_FORMAT[tt.tournament.format || 'F11x11'] ?? 11;
@@ -1248,12 +1125,6 @@ router.post('/tournament-teams/:ttId(\\d+)/publish', async (req, res) => {
     const { matchId, reset = true, roleFilter = 'ALL' } = req.body || {};
     if (!matchId) return res.status(400).json({ error: 'matchId обязателен' });
 
-    const tt = await prisma.tournamentTeam.findUnique({
-      where: { id },
-      include: { tournament: true, captainRosterItem: true },
-    });
-    if (!tt) return res.status(404).json({ error: 'TournamentTeam не найден' });
-
     const m = await prisma.tournamentMatch.findUnique({
       where: { id: Number(matchId) },
       select: {
@@ -1264,49 +1135,24 @@ router.post('/tournament-teams/:ttId(\\d+)/publish', async (req, res) => {
       },
     });
     if (!m) return res.status(404).json({ error: 'Матч не найден' });
-    if (m.tournamentId !== tt.tournamentId)
-      return res.status(400).json({ error: 'Матч не из этого турнира' });
-    if (![m.team1TTId, m.team2TTId].includes(tt.id))
+    if (![m.team1TTId, m.team2TTId].includes(id))
       return res.status(400).json({ error: 'Команда не участвует в матче' });
 
-    const roster = await prisma.tournamentTeamPlayer.findMany({
-      where: {
-        tournamentTeamId: id,
-        ...(roleFilter === 'STARTER' ? { role: 'STARTER' } : {}),
-      },
-      orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
-    });
-
-    const rows = await prisma.$transaction(async (tx) => {
-      if (reset) {
-        await tx.tournamentPlayerMatch.deleteMany({
-          where: {
-            matchId: Number(matchId),
-            tournamentTeamPlayerId: { in: roster.map((r) => r.id) },
-          },
-        });
-      }
-      if (roster.length) {
-        await tx.tournamentPlayerMatch.createMany({
-          data: roster.map((r) => ({
-            matchId: Number(matchId),
-            tournamentTeamPlayerId: r.id,
-            role: r.role ?? 'STARTER',
-            position: r.position ?? null,
-            isCaptain: tt.captainRosterItemId
-              ? r.id === tt.captainRosterItemId
-              : false,
-            order: r.number != null ? r.number : 0,
-          })),
-          skipDuplicates: true,
-        });
-      }
-
-      return tx.tournamentPlayerMatch.findMany({
-        where: { matchId: Number(matchId) },
-        include: { tournamentTeamPlayer: { include: { player: true } } },
-        orderBy: [{ role: 'asc' }, { order: 'asc' }],
+    if (reset) {
+      await prisma.tournamentPlayerMatch.deleteMany({
+        where: {
+          matchId: Number(matchId),
+          tournamentTeamPlayer: { tournamentTeamId: id },
+        },
       });
+    }
+
+    await publishRosterToMatch(Number(matchId), id, roleFilter);
+
+    const rows = await prisma.tournamentPlayerMatch.findMany({
+      where: { matchId: Number(matchId) },
+      include: { tournamentTeamPlayer: { include: { player: true } } },
+      orderBy: [{ role: 'asc' }, { order: 'asc' }],
     });
 
     const io = getIO();
@@ -1325,105 +1171,6 @@ router.post('/tournament-teams/:ttId(\\d+)/publish', async (req, res) => {
 });
 
 /* =========================================================
-   ROUNDS
-========================================================= */
-router.get('/tournaments/:id(\\d+)/rounds', async (req, res) => {
-  try {
-    const tournamentId = Number(req.params.id);
-    const rows = await prisma.tournamentRound.findMany({
-      where: { tournamentId },
-      orderBy: [{ number: 'asc' }, { stage: 'asc' }],
-    });
-    res.json(rows);
-  } catch (e) {
-    console.error('GET /tournaments/:id/rounds', e);
-    res.status(500).json({ error: 'Ошибка загрузки раундов' });
-  }
-});
-
-router.post('/tournaments/:id(\\d+)/rounds', async (req, res) => {
-  try {
-    const tournamentId = Number(req.params.id);
-    const { stage, name, number, date } = req.body || {};
-    if (!stage)
-      return res.status(422).json({ error: 'Поле stage обязательно' });
-
-    const exists = await prisma.tournamentRound.findFirst({
-      where: {
-        tournamentId,
-        stage,
-        number: number == null ? null : Number(number),
-      },
-    });
-    if (exists) return res.status(200).json(exists);
-
-    const created = await prisma.tournamentRound.create({
-      data: {
-        tournamentId,
-        stage,
-        name: name ?? null,
-        number: number == null || number === '' ? null : Number(number),
-        date: date ? new Date(date) : null,
-      },
-    });
-
-    getIO().to(`tournament:${tournamentId}`).emit('rounds:updated');
-    res.status(201).json(created);
-  } catch (e) {
-    if (e?.code === 'P2002') {
-      return res
-        .status(409)
-        .json({ error: 'Раунд с такой стадией и номером уже существует' });
-    }
-    console.error('POST /tournaments/:id/rounds', e);
-    res.status(400).json({ error: e?.message || 'Ошибка создания раунда' });
-  }
-});
-
-router.put('/tournament-rounds/:roundId(\\d+)', async (req, res) => {
-  try {
-    const id = Number(req.params.roundId);
-    const { stage, name, number, date } = req.body;
-    const upd = await prisma.tournamentRound.update({
-      where: { id },
-      data: {
-        stage: stage ?? undefined,
-        name: name ?? undefined,
-        number: toInt(number, undefined),
-        date: toDate(date, undefined),
-      },
-    });
-
-    const t = await prisma.tournamentRound.findUnique({
-      where: { id },
-      select: { tournamentId: true },
-    });
-    if (t) getIO().to(`tournament:${t.tournamentId}`).emit('rounds:updated');
-    res.json(upd);
-  } catch (e) {
-    console.error('PUT /tournament-rounds/:roundId', e);
-    res.status(400).json({ error: 'Ошибка обновления раунда' });
-  }
-});
-
-router.delete('/tournament-rounds/:roundId(\\d+)', async (req, res) => {
-  try {
-    const id = Number(req.params.roundId);
-    const t = await prisma.tournamentRound.findUnique({
-      where: { id },
-      select: { tournamentId: true },
-    });
-    await prisma.tournamentRound.delete({ where: { id } });
-
-    if (t) getIO().to(`tournament:${t.tournamentId}`).emit('rounds:updated');
-    res.json({ success: true });
-  } catch (e) {
-    console.error('DELETE /tournament-rounds/:roundId', e);
-    res.status(500).json({ error: 'Ошибка удаления раунда' });
-  }
-});
-
-/* =========================================================
    GROUPS (круги)
 ========================================================= */
 router.get('/tournaments/:id(\\d+)/groups', async (req, res) => {
@@ -1432,6 +1179,7 @@ router.get('/tournaments/:id(\\d+)/groups', async (req, res) => {
     const rows = await prisma.tournamentGroup.findMany({
       where: { tournamentId },
       include: {
+        defaultReferee: true,
         teams: { include: { tournamentTeam: { include: { team: true } } } },
       },
       orderBy: [{ id: 'asc' }],
@@ -1446,13 +1194,13 @@ router.get('/tournaments/:id(\\d+)/groups', async (req, res) => {
 router.post('/tournaments/:id(\\d+)/groups', async (req, res) => {
   try {
     const tournamentId = Number(req.params.id);
-    const { name, type = 'ROUND1', roundId = null } = req.body || {};
+    const { name, type = 'ROUND1', defaultRefereeId = null } = req.body || {};
     const created = await prisma.tournamentGroup.create({
       data: {
         tournamentId,
         name,
         type,
-        roundId: toInt(roundId, null),
+        defaultRefereeId: toInt(defaultRefereeId, null),
       },
     });
     res.status(201).json(created);
@@ -1473,12 +1221,104 @@ router.delete('/tournament-groups/:groupId(\\d+)', async (req, res) => {
   }
 });
 
+// PUT /tournament-groups/:groupId/referee?apply=true
+router.put('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    const refereeId = toInt(req.body?.refereeId, null);
+    const apply = String(req.query.apply || 'false') === 'true';
+
+    const g = await prisma.tournamentGroup.update({
+      where: { id: groupId },
+      data: { defaultRefereeId: refereeId },
+      select: { id: true, tournamentId: true, defaultRefereeId: true },
+    });
+
+    if (apply && refereeId) {
+      const ids = await prisma.tournamentMatch
+        .findMany({
+          where: { groupId },
+          select: { id: true },
+        })
+        .then((r) => r.map((x) => x.id));
+
+      if (ids.length) {
+        await prisma.tournamentMatchReferee.createMany({
+          data: ids.map((id) => ({ matchId: id, refereeId, role: 'MAIN' })),
+          skipDuplicates: true,
+        });
+        // проставим судью в событиях без выдавшего
+        await prisma.tournamentMatchEvent.updateMany({
+          where: { matchId: { in: ids }, issuedByRefereeId: null },
+          data: { issuedByRefereeId: refereeId },
+        });
+      }
+    }
+
+    res.json(g);
+  } catch (e) {
+    console.error('PUT /tournament-groups/:groupId/referee', e);
+    res.status(400).json({ error: 'Не удалось сохранить судью группы' });
+  }
+});
+
+router.post('/tournament-groups/:groupId(\\d+)/referee', (req, res) => {
+  // просто прокидываем в уже реализованный PUT-хендлер
+  req.method = 'PUT';
+  router.handle(req, res);
+});
+
+router.post(
+  '/tournament-groups/:groupId(\\d+)/referee/apply',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const g = await prisma.tournamentGroup.findUnique({
+        where: { id: groupId },
+        select: { defaultRefereeId: true, tournamentId: true },
+      });
+      if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+      if (!g.defaultRefereeId)
+        return res.status(400).json({ error: 'В группе не выбран судья' });
+
+      const matches = await prisma.tournamentMatch.findMany({
+        where: { groupId },
+        select: { id: true },
+      });
+      const ids = matches.map((m) => m.id);
+
+      if (ids.length) {
+        await prisma.tournamentMatchReferee.createMany({
+          data: ids.map((id) => ({
+            matchId: id,
+            refereeId: g.defaultRefereeId,
+            role: 'MAIN',
+          })),
+          skipDuplicates: true,
+        });
+
+        await prisma.tournamentMatchEvent.updateMany({
+          where: { matchId: { in: ids }, issuedByRefereeId: null },
+          data: { issuedByRefereeId: g.defaultRefereeId },
+        });
+      }
+
+      res.json({ success: true, affectedMatches: ids.length });
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/referee/apply', e);
+      res.status(400).json({ error: 'Не удалось применить судью для группы' });
+    }
+  }
+);
+
 router.post(
   '/tournament-groups/:groupId(\\d+)/teams/:ttId(\\d+)',
   async (req, res) => {
     try {
       const groupId = Number(req.params.groupId);
       const tournamentTeamId = Number(req.params.ttId);
+
+      // валидируем принадлежность TT турниру группы
       const g = await prisma.tournamentGroup.findUnique({
         where: { id: groupId },
         select: { tournamentId: true },
@@ -1492,8 +1332,10 @@ router.post(
       if (!tt || tt.tournamentId !== g.tournamentId)
         return res.status(400).json({ error: 'Команда не из этого турнира' });
 
-      const row = await prisma.tournamentGroupTeam.create({
-        data: { tournamentId: g.tournamentId, groupId, tournamentTeamId },
+      const row = await prisma.tournamentGroupTeam.upsert({
+        where: { groupId_tournamentTeamId: { groupId, tournamentTeamId } },
+        update: {},
+        create: { tournamentId: g.tournamentId, groupId, tournamentTeamId },
       });
       res.status(201).json(row);
     } catch (e) {
@@ -1508,9 +1350,9 @@ router.delete(
   async (req, res) => {
     try {
       const groupId = Number(req.params.groupId);
-      const ttId = Number(req.params.ttId);
-      await prisma.tournamentGroupTeam.deleteMany({
-        where: { groupId, tournamentTeamId: ttId },
+      const tournamentTeamId = Number(req.params.ttId);
+      await prisma.tournamentGroupTeam.delete({
+        where: { groupId_tournamentTeamId: { groupId, tournamentTeamId } },
       });
       res.json({ success: true });
     } catch (e) {
@@ -1520,15 +1362,17 @@ router.delete(
   }
 );
 
-// генерация «каждый с каждым» (1 или 2 круга)
+// генерация «каждый с каждым» только для ROUND1/ROUND2 (1 или 2 круга подряд)
+// генерация «каждый с каждым» c днями недели и лимитом матчей в день
 router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
   try {
     const groupId = Number(req.params.groupId);
     const {
-      rounds = 1,
-      roundId,
-      dateStart = null,
-      matchGapDays = 7,
+      rounds, // 1|2 (если не передан — из типа группы)
+      dateStart = null, // 'YYYY-MM-DDTHH:mm'
+      perDay = 2, // Сколько матчей в день
+      daysOfWeek = [6, 7], // 1=Пн ... 7=Вс
+      stadiumId: rawGenStadiumId = null, // опционально общий стадион
     } = req.body || {};
 
     const g = await prisma.tournamentGroup.findUnique({
@@ -1539,18 +1383,16 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
       },
     });
     if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-    if (!roundId && !g.roundId) {
-      return res
-        .status(400)
-        .json({ error: 'Укажите roundId (или сохраните его в группе)' });
+    if (g.type === 'PLAYOFF') {
+      return res.status(400).json({ error: 'PLAYOFF генерируйте вручную' });
     }
 
-    const rId = Number(roundId || g.roundId);
     const list = g.teams.map((t) => t.tournamentTeamId);
     const N = list.length;
     if (N < 2)
       return res.status(400).json({ error: 'Недостаточно команд в группе' });
 
+    // ----- круговой алгоритм -----
     const BYE = -1;
     const teams = N % 2 ? [...list, BYE] : [...list];
     const K = teams.length;
@@ -1562,7 +1404,6 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
       const fixed = teams[0];
       const left = [fixed, ...arr.slice(0, half - 1)];
       const right = arr.slice(half - 1).reverse();
-
       const pairs = [];
       for (let i = 0; i < half; i++) {
         const a = left[i];
@@ -1573,44 +1414,97 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
       arr = [arr[arr.length - 1], ...arr.slice(0, arr.length - 1)];
     }
 
-    let curDate = dateStart ? new Date(dateStart) : new Date();
+    const effectiveRounds = Number.isFinite(Number(rounds))
+      ? Number(rounds)
+      : g.type === 'ROUND2'
+        ? 2
+        : 1;
 
-    const created = [];
-    for (let r = 0; r < roundsSchedule.length; r++) {
-      const pairs = roundsSchedule[r];
-      for (const [tt1, tt2] of pairs) {
-        const m1 = await prisma.tournamentMatch.create({
-          data: {
-            date: curDate,
-            status: 'SCHEDULED',
-            tournament: { connect: { id: g.tournamentId } },
-            round: { connect: { id: rId } },
-            group: { connect: { id: g.id } },
-            team1TT: { connect: { id: tt1 } },
-            team2TT: { connect: { id: tt2 } },
-          },
-        });
-        created.push(m1);
-        if (Number(rounds) === 2) {
-          const m2 = await prisma.tournamentMatch.create({
-            data: {
-              date: new Date(
-                curDate.getTime() + (matchGapDays || 7) * 24 * 3600 * 1000
-              ),
-              status: 'SCHEDULED',
-              tournament: { connect: { id: g.tournamentId } },
-              round: { connect: { id: rId } },
-              group: { connect: { id: g.id } },
-              team1TT: { connect: { id: tt2 } },
-              team2TT: { connect: { id: tt1 } },
-            },
-          });
-          created.push(m2);
+    // Сформируем плоский список пар (учитываем 2-й круг с реверсом)
+    const pairList = [];
+    for (let r = 1; r <= effectiveRounds; r++) {
+      for (const pairs of roundsSchedule) {
+        for (const [a, b] of pairs) {
+          pairList.push(r === 1 ? [a, b] : [b, a]);
         }
       }
-      curDate = new Date(
-        curDate.getTime() + (matchGapDays || 7) * 24 * 3600 * 1000
-      );
+    }
+
+    // ----- подготовка слот-дней -----
+    const base = dateStart ? new Date(dateStart) : new Date();
+    const timeH = base.getHours();
+    const timeM = base.getMinutes();
+
+    let dows = Array.isArray(daysOfWeek)
+      ? daysOfWeek.map((n) => Number(n)).filter((n) => n >= 1 && n <= 7)
+      : [];
+    if (!dows.length) dows = [6, 7]; // Сб, Вс по умолчанию
+    dows.sort((a, b) => a - b);
+
+    const startOfWeekMon = (d) => {
+      const js = d.getDay(); // 0=Вс ... 6=Сб
+      const delta = js === 0 ? -6 : 1 - js; // до понедельника
+      const x = new Date(d);
+      x.setHours(0, 0, 0, 0);
+      x.setDate(x.getDate() + delta);
+      return x;
+    };
+
+    const slots = [];
+    const need = pairList.length;
+    const week0 = startOfWeekMon(base);
+
+    for (let w = 0; slots.length < need && w < 1000; w++) {
+      for (const dow of dows) {
+        const addDays = dow - 1 + w * 7; // 1=Пн → +0
+        const day = new Date(week0);
+        day.setDate(day.getDate() + addDays);
+        day.setHours(timeH, timeM, 0, 0);
+        if (day < base) continue;
+        for (let k = 0; k < Math.max(1, Number(perDay)); k++) {
+          slots.push(new Date(day));
+          if (slots.length >= need) break;
+        }
+        if (slots.length >= need) break;
+      }
+    }
+    if (slots.length < need) {
+      return res
+        .status(400)
+        .json({ error: 'Недостаточно слотов по заданным дням/лимитам' });
+    }
+
+    const genStadiumId = toInt(rawGenStadiumId, null);
+
+    // ----- создаём матчи по слотам -----
+    const created = [];
+    for (let i = 0; i < pairList.length; i++) {
+      const [tt1, tt2] = pairList[i];
+      const when = slots[i];
+
+      const m = await prisma.tournamentMatch.create({
+        data: {
+          date: when,
+          status: 'SCHEDULED',
+          tournament: { connect: { id: g.tournamentId } },
+          group: { connect: { id: g.id } },
+          team1TT: { connect: { id: tt1 } },
+          team2TT: { connect: { id: tt2 } },
+          ...(genStadiumId
+            ? { stadiumRel: { connect: { id: genStadiumId } } }
+            : {}),
+        },
+      });
+      created.push(m);
+
+      if (g.defaultRefereeId) {
+        await prisma.tournamentMatchReferee.createMany({
+          data: [
+            { matchId: m.id, refereeId: g.defaultRefereeId, role: 'MAIN' },
+          ],
+          skipDuplicates: true,
+        });
+      }
     }
 
     const io = getIO();
@@ -1628,101 +1522,67 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
 });
 
 /* =========================================================
-   TIES (пары плей-офф)
+   STAGES (алиасы над GROUPS)
 ========================================================= */
-router.get('/tournaments/:id(\\d+)/ties', async (req, res) => {
-  try {
-    const tournamentId = Number(req.params.id);
-    const rows = await prisma.tournamentTie.findMany({
-      where: { tournamentId },
-      include: {
-        team1TT: { include: { team: true } },
-        team2TT: { include: { team: true } },
-      },
-      orderBy: [{ id: 'asc' }],
-    });
-    res.json(rows);
-  } catch (e) {
-    console.error('GET /tournaments/:id/ties', e);
-    res.status(500).json({ error: 'Ошибка загрузки пар' });
-  }
+
+router.get('/tournaments/:id(\\d+)/stages', async (req, res) => {
+  req.url = req.url.replace('/stages', '/groups');
+  return router.handle(req, res);
 });
 
-router.post('/tournaments/:id(\\d+)/ties', async (req, res) => {
+router.post('/tournaments/:id(\\d+)/stages', async (req, res) => {
   try {
     const tournamentId = Number(req.params.id);
-    const { roundId, team1TTId, team2TTId, legs = 1 } = req.body;
-    const created = await prisma.tournamentTie.create({
+    const { name, type = 'ROUND1', defaultRefereeId = null } = req.body || {};
+    const created = await prisma.tournamentGroup.create({
       data: {
         tournamentId,
-        roundId: Number(roundId),
-        team1TTId: Number(team1TTId),
-        team2TTId: Number(team2TTId),
-        legs: toInt(legs, 1),
+        name,
+        type,
+        defaultRefereeId: toInt(defaultRefereeId, null),
       },
     });
-
-    getIO().to(`tournament:${tournamentId}`).emit('tie:updated', created);
     res.status(201).json(created);
   } catch (e) {
-    console.error('POST /tournaments/:id/ties', e);
-    res.status(400).json({ error: 'Ошибка создания пары' });
+    console.error('POST /tournaments/:id/stages', e);
+    res.status(400).json({ error: 'Не удалось создать этап' });
   }
 });
 
-router.put('/tournament-ties/:tieId(\\d+)', async (req, res) => {
+router.delete('/tournament-stages/:stageId(\\d+)', async (req, res) => {
   try {
-    const id = Number(req.params.tieId);
-    const { roundId, team1TTId, team2TTId, legs, winnerTTId } = req.body;
-    const upd = await prisma.tournamentTie.update({
-      where: { id },
-      data: {
-        roundId: toInt(roundId, undefined),
-        team1TTId: toInt(team1TTId, undefined),
-        team2TTId: toInt(team2TTId, undefined),
-        legs: toInt(legs, undefined),
-        winnerTTId: toInt(winnerTTId, undefined),
-      },
+    await prisma.tournamentGroup.delete({
+      where: { id: Number(req.params.stageId) },
     });
-
-    getIO().to(`ttie:${id}`).emit('tie:updated', upd);
-    res.json(upd);
-  } catch (e) {
-    console.error('PUT /tournament-ties/:tieId', e);
-    res.status(400).json({ error: 'Ошибка обновления пары' });
-  }
-});
-
-router.post('/tournament-ties/:tieId(\\d+)/recalc', async (req, res) => {
-  try {
-    const id = Number(req.params.tieId);
-    const result = await recalcTie(id);
-    res.json(result);
-  } catch (e) {
-    console.error('POST /tournament-ties/:tieId/recalc', e);
-    res.status(400).json({ error: 'Не удалось пересчитать итог пары' });
-  }
-});
-
-router.delete('/tournament-ties/:tieId(\\d+)', async (req, res) => {
-  try {
-    const id = Number(req.params.tieId);
-    const t = await prisma.tournamentTie.findUnique({
-      where: { id },
-      select: { tournamentId: true },
-    });
-    await prisma.tournamentTie.delete({ where: { id } });
-
-    if (t) {
-      getIO()
-        .to(`tournament:${t.tournamentId}`)
-        .emit('tie:updated', { deletedId: id });
-    }
     res.json({ success: true });
   } catch (e) {
-    console.error('DELETE /tournament-ties/:tieId', e);
-    res.status(500).json({ error: 'Ошибка удаления пары' });
+    console.error('DELETE /tournament-stages/:stageId', e);
+    res.status(400).json({ error: 'Не удалось удалить этап' });
   }
+});
+
+router.post(
+  '/tournament-stages/:stageId(\\d+)/teams/:ttId(\\d+)',
+  async (req, res) => {
+    req.url = req.url
+      .replace('/tournament-stages/', '/tournament-groups/')
+      .replace('/teams/', '/teams/');
+    return router.handle(req, res);
+  }
+);
+router.delete(
+  '/tournament-stages/:stageId(\\d+)/teams/:ttId(\\d+)',
+  async (req, res) => {
+    req.url = req.url
+      .replace('/tournament-stages/', '/tournament-groups/')
+      .replace('/teams/', '/teams/');
+    return router.handle(req, res);
+  }
+);
+
+router.post('/tournament-stages/:stageId(\\d+)/generate', async (req, res) => {
+  req.url = req.url.replace('/tournament-stages/', '/tournament-groups/');
+  return router.handle(req, res);
 });
 
 /* =========================================================
@@ -1746,8 +1606,6 @@ router.get('/tournaments/:id(\\d+)/matches', async (req, res) => {
     );
 
     const AND = [{ tournamentId }];
-    if (filter.roundId != null) AND.push({ roundId: Number(filter.roundId) });
-    if (filter.tieId != null) AND.push({ tieId: Number(filter.tieId) });
     if (filter.groupId != null) AND.push({ groupId: Number(filter.groupId) });
     if (typeof filter.status === 'string' && filter.status.trim())
       AND.push({ status: filter.status.trim() });
@@ -1761,7 +1619,7 @@ router.get('/tournaments/:id(\\d+)/matches', async (req, res) => {
     }
 
     const where = { AND };
-    const [rows, total] = await Promise.all([
+    const [rowsRaw, total] = await Promise.all([
       prisma.tournamentMatch.findMany({
         skip: start,
         take,
@@ -1771,6 +1629,10 @@ router.get('/tournaments/:id(\\d+)/matches', async (req, res) => {
       }),
       prisma.tournamentMatch.count({ where }),
     ]);
+
+    // нормализация стадиона
+    const rows = rowsRaw.map(normalizeMatch);
+
     setRange(res, 'tournamentMatches', start, rows.length, total);
     res.json(rows);
   } catch (e) {
@@ -1791,7 +1653,8 @@ router.get('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       include,
     });
     if (!item) return res.status(404).json({ error: 'Матч не найден' });
-    res.json(item);
+
+    res.json(normalizeMatch(item));
   } catch (e) {
     console.error('GET /tournament-matches/:matchId', e);
     res.status(500).json({ error: 'Ошибка получения матча' });
@@ -1803,15 +1666,12 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
   try {
     const tournamentId = Number(req.params.id);
     const {
-      roundId,
-      tieId,
       groupId,
       team1TTId,
       team2TTId,
       date,
       status = 'SCHEDULED',
-      stadiumId,
-      legNumber,
+      stadiumId, // может быть и объект stadium.id
       team1Formation,
       team2Formation,
       team1Coach,
@@ -1819,14 +1679,53 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       referees = [],
     } = req.body;
 
+    if (Number(team1TTId) === Number(team2TTId)) {
+      return res.status(400).json({ error: 'Команды в матче совпадают' });
+    }
+
+    // валидация TT принадлежности турниру
+    const [tt1, tt2] = await Promise.all([
+      prisma.tournamentTeam.findUnique({
+        where: { id: Number(team1TTId) },
+        select: { tournamentId: true },
+      }),
+      prisma.tournamentTeam.findUnique({
+        where: { id: Number(team2TTId) },
+        select: { tournamentId: true },
+      }),
+    ]);
+    if (!tt1 || !tt2) return res.status(400).json({ error: 'TT не найдены' });
+    if (
+      tt1.tournamentId !== tournamentId ||
+      tt2.tournamentId !== tournamentId
+    ) {
+      return res
+        .status(400)
+        .json({ error: 'Команда не принадлежит этому турниру' });
+    }
+
+    if (toInt(groupId, null)) {
+      const g = await prisma.tournamentGroup.findUnique({
+        where: { id: Number(groupId) },
+        select: { tournamentId: true },
+      });
+      if (!g || g.tournamentId !== tournamentId) {
+        return res
+          .status(400)
+          .json({ error: 'Группа не принадлежит этому турниру' });
+      }
+    }
+
+    const stadiumIdNum = toInt(stadiumId ?? req.body?.stadium?.id, null);
+
     const data = {
       date: toDate(date, new Date()),
       status,
-      legNumber: toInt(legNumber, null),
       team1Formation: team1Formation ?? null,
       team2Formation: team2Formation ?? null,
       team1Coach: team1Coach ?? null,
       team2Coach: team2Coach ?? null,
+
       referees: {
         create: (referees || []).map((r) => ({
           refereeId: Number(r.refereeId),
@@ -1837,18 +1736,35 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       team1TT: { connect: { id: Number(team1TTId) } },
       team2TT: { connect: { id: Number(team2TTId) } },
     };
-    if (toInt(roundId, null)) data.round = { connect: { id: Number(roundId) } };
-    if (toInt(tieId, null)) data.tie = { connect: { id: Number(tieId) } };
     if (toInt(groupId, null)) data.group = { connect: { id: Number(groupId) } };
-    if (toInt(stadiumId, null))
-      data.stadiumRel = { connect: { id: Number(stadiumId) } };
+    if (stadiumIdNum) data.stadiumRel = { connect: { id: stadiumIdNum } };
 
     const created = await prisma.tournamentMatch.create({
       data,
       include: buildTMatchInclude('team1,team2,stadium,referees,group'),
     });
 
-    // автопубликация заявок
+    // если у группы задан судья — добавить как MAIN
+    if (created.groupId) {
+      const grp = await prisma.tournamentGroup.findUnique({
+        where: { id: created.groupId },
+        select: { defaultRefereeId: true },
+      });
+      if (grp?.defaultRefereeId) {
+        await prisma.tournamentMatchReferee.createMany({
+          data: [
+            {
+              matchId: created.id,
+              refereeId: grp.defaultRefereeId,
+              role: 'MAIN',
+            },
+          ],
+          skipDuplicates: true,
+        });
+      }
+    }
+
+    // автопубликация
     const tset = await prisma.tournament.findUnique({
       where: { id: created.tournamentId },
       select: { autoPublishParticipants: true },
@@ -1863,31 +1779,39 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
     const io = getIO();
     io.to(`tournament:${tournamentId}`).emit('tmatch:created', created);
     io.to(`tmatch:${created.id}`).emit('tmatch:update', created);
-    if (created.tieId)
-      io.to(`ttie:${created.tieId}`).emit('tmatch:created', created);
 
-    res.status(201).json(created);
+    res.status(201).json(normalizeMatch(created));
   } catch (e) {
     console.error('POST /tournaments/:id/matches', e);
     res.status(400).json({ error: e.message || 'Ошибка создания матча' });
   }
 });
 
-// patch
+// patch (с обработкой FINISHED)
 router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
+    const old = await prisma.tournamentMatch.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        tournamentId: true,
+        groupId: true,
+        team1TTId: true,
+        team2TTId: true,
+        status: true,
+      },
+    });
+    if (!old) return res.status(404).json({ error: 'Матч не найден' });
+
     const patch = {};
     const keys = [
-      'roundId',
-      'tieId',
       'groupId',
       'team1TTId',
       'team2TTId',
       'date',
       'status',
       'stadiumId',
-      'legNumber',
       'team1Formation',
       'team2Formation',
       'team1Coach',
@@ -1897,26 +1821,105 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
     ];
     for (const k of keys) {
       if (!(k in req.body)) continue;
-      if (
-        k.endsWith('Id') ||
-        ['legNumber', 'team1Score', 'team2Score'].includes(k)
-      )
+      if (k.endsWith('Id') || ['team1Score', 'team2Score'].includes(k))
         patch[k] = toInt(req.body[k], null);
       else if (k === 'date') patch[k] = toDate(req.body[k], undefined);
       else patch[k] = req.body[k] ?? null;
     }
+
+    // поддержка stadium как объекта
+    if ('stadium' in req.body && !('stadiumId' in req.body)) {
+      patch.stadiumId = toInt(req.body.stadium?.id, null);
+    }
+
+    // валидации TT, group
+    if (patch.team1TTId != null || patch.team2TTId != null) {
+      const team1TTId = patch.team1TTId ?? old.team1TTId;
+      const team2TTId = patch.team2TTId ?? old.team2TTId;
+      if (team1TTId === team2TTId)
+        return res.status(400).json({ error: 'Команды в матче совпадают' });
+
+      const [tt1, tt2] = await Promise.all([
+        prisma.tournamentTeam.findUnique({
+          where: { id: team1TTId },
+          select: { tournamentId: true },
+        }),
+        prisma.tournamentTeam.findUnique({
+          where: { id: team2TTId },
+          select: { tournamentId: true },
+        }),
+      ]);
+      if (!tt1 || !tt2) return res.status(400).json({ error: 'TT не найдены' });
+      if (
+        tt1.tournamentId !== old.tournamentId ||
+        tt2.tournamentId !== old.tournamentId
+      )
+        return res.status(400).json({ error: 'TT не из турнира матча' });
+    }
+    if (patch.groupId != null) {
+      const g = await prisma.tournamentGroup.findUnique({
+        where: { id: patch.groupId },
+        select: { tournamentId: true },
+      });
+      if (!g || g.tournamentId !== old.tournamentId)
+        return res.status(400).json({ error: 'Группа не из турнира матча' });
+    }
+
     const upd = await prisma.tournamentMatch.update({
       where: { id },
       data: patch,
+      include: buildTMatchInclude('team1,team2,stadium,referees,group'),
     });
+
+    if (patch.groupId !== undefined) {
+      const newGroupId = upd.groupId;
+      if (newGroupId) {
+        const g = await prisma.tournamentGroup.findUnique({
+          where: { id: newGroupId },
+          select: { defaultRefereeId: true },
+        });
+        if (g?.defaultRefereeId) {
+          const hasMain = await prisma.tournamentMatchReferee.findFirst({
+            where: { matchId: id, role: 'MAIN' },
+            select: { id: true },
+          });
+          if (!hasMain) {
+            await prisma.tournamentMatchReferee.create({
+              data: {
+                matchId: id,
+                refereeId: g.defaultRefereeId,
+                role: 'MAIN',
+              },
+            });
+            await prisma.tournamentMatchEvent.updateMany({
+              where: { matchId: id, issuedByRefereeId: null },
+              data: { issuedByRefereeId: g.defaultRefereeId },
+            });
+          }
+        }
+      }
+    }
+
+    // если матч стал FINISHED или обновили счёт у FINISHED — пересчитать
+    if (!isFinished(old.status) && isFinished(upd.status)) {
+      await recomputeTMatchScore(id); // на случай если правили события/счёт вручную
+      await serveSuspensionsAfterMatch(id);
+      await recalcTotalsIfFinished(id);
+    }
+
+    // НОВОЕ: если матч был FINISHED и стал не FINISHED — убрать из тоталов
+    if (isFinished(old.status) && !isFinished(upd.status)) {
+      const t1Id = upd.team1TT?.team?.id;
+      const t2Id = upd.team2TT?.team?.id;
+      if (t1Id) await recalcTeamTotals(t1Id);
+      if (t2Id) await recalcTeamTotals(t2Id);
+    }
 
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:update', upd);
     io.to(`tournament:${upd.tournamentId}`).emit('tmatch:update', upd);
-    if (upd.tieId) io.to(`ttie:${upd.tieId}`).emit('tmatch:update', upd);
-    if (patch.status === 'FINISHED' && upd.tieId) await recalcTie(upd.tieId);
 
-    res.json(upd);
+    res.json(normalizeMatch(upd));
   } catch (e) {
     console.error('PATCH /tournament-matches/:matchId', e);
     res.status(400).json({ error: 'Ошибка обновления матча' });
@@ -1931,20 +1934,34 @@ router.put('/tournament-matches/:matchId(\\d+)', (req, res) => {
 router.delete('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
-    const m = await prisma.tournamentMatch.findUnique({
+
+    // возьмём статус и команды ДО удаления
+    const before = await prisma.tournamentMatch.findUnique({
       where: { id },
-      select: { tournamentId: true, tieId: true },
+      select: {
+        tournamentId: true,
+        status: true,
+        team1TT: { select: { team: { select: { id: true } } } },
+        team2TT: { select: { team: { select: { id: true } } } },
+      },
     });
+
     await prisma.tournamentMatch.delete({ where: { id } });
+
+    // если удалили завершённый матч — пересчитаем тоталы команд
+    if (before && isFinished(before.status)) {
+      await Promise.all([
+        recalcTeamTotals(before.team1TT.team.id),
+        recalcTeamTotals(before.team2TT.team.id),
+      ]);
+    }
 
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:deleted', { matchId: id });
-    if (m) {
-      io.to(`tournament:${m.tournamentId}`).emit('tmatch:deleted', {
+    if (before) {
+      io.to(`tournament:${before.tournamentId}`).emit('tmatch:deleted', {
         matchId: id,
       });
-      if (m.tieId)
-        io.to(`ttie:${m.tieId}`).emit('tmatch:deleted', { matchId: id });
       io.in(`tmatch:${id}`).socketsLeave(`tmatch:${id}`);
     }
     res.json({ success: true });
@@ -1987,6 +2004,7 @@ router.post('/tournament-matches/:matchId(\\d+)/finish', async (req, res) => {
     });
 
     await serveSuspensionsAfterMatch(id);
+    await recalcTotalsIfFinished(id); // <— важный вызов
 
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:status', {
@@ -1999,8 +2017,6 @@ router.post('/tournament-matches/:matchId(\\d+)/finish', async (req, res) => {
       team2Score: m.team2Score,
     });
     io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', m);
-    if (m.tieId) await recalcTie(m.tieId);
-
     res.json(m);
   } catch (e) {
     console.error('POST /tournament-matches/:id/finish', e);
@@ -2018,6 +2034,8 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
       data: { team1Score, team2Score },
     });
 
+    await recalcTotalsIfFinished(id); // <— если матч уже FINISHED
+
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:score', {
       matchId: id,
@@ -2025,11 +2043,48 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
       team2Score,
     });
     io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', m);
-    if (m.status === 'FINISHED' && m.tieId) await recalcTie(m.tieId);
     res.json(m);
   } catch (e) {
     console.error('POST /tournament-matches/:id/score', e);
     res.status(400).json({ error: 'Не удалось обновить счёт' });
+  }
+  try {
+    const t1 = await prisma.tournamentMatch.findUnique({
+      where: { id },
+      select: {
+        team1TT: { select: { teamId: true } },
+        team2TT: { select: { teamId: true } },
+        status: true,
+      },
+    });
+    if (t1?.team1TT?.teamId) await recalcTeamTotals(t1.team1TT.teamId);
+    if (t1?.team2TT?.teamId) await recalcTeamTotals(t1.team2TT.teamId);
+  } catch {}
+  // если матч уже завершён — ещё раз подтвердим
+  await recalcTotalsIfFinished(id);
+});
+
+router.post('/maintenance/recalc/team-totals', async (req, res) => {
+  try {
+    const teamIds = await prisma.team
+      .findMany({ select: { id: true } })
+      .then((x) => x.map((t) => t.id));
+    for (const id of teamIds) await recalcTeamTotals(id);
+    res.json({ success: true, teams: teamIds.length });
+  } catch (e) {
+    console.error('recalc all teams', e);
+    res.status(500).json({ error: 'Не удалось пересчитать' });
+  }
+});
+
+// пересчитать конкретной команде
+router.post('/teams/:teamId(\\d+)/recalc', async (req, res) => {
+  try {
+    const teamId = Number(req.params.teamId);
+    await recalcTeamTotals(teamId);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Не удалось пересчитать команду' });
   }
 });
 
@@ -2040,7 +2095,7 @@ router.get('/tournament-matches/:matchId(\\d+)/referees', async (req, res) => {
     const rows = await prisma.tournamentMatchReferee.findMany({
       where: { matchId: id },
       include: { referee: true },
-      orderBy: { id: 'asc' },
+      orderBy: { refereeId: 'asc' },
     });
     res.json(rows);
   } catch (e) {
@@ -2066,6 +2121,7 @@ router.post('/tournament-matches/:matchId(\\d+)/referees', async (req, res) => {
             refereeId: Number(r.refereeId),
             role: r.role ?? null,
           })),
+          skipDuplicates: true,
         });
       }
     });
@@ -2193,6 +2249,27 @@ router.put(
         : Array.isArray(req.body?.items)
           ? req.body.items
           : [];
+
+      // валидация: игроки должны принадлежать одной из двух команд этого матча
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id },
+        select: { tournamentId: true, team1TTId: true, team2TTId: true },
+      });
+      if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+      const rosterItems = await prisma.tournamentTeamPlayer.findMany({
+        where: {
+          id: { in: items.map((p) => Number(p.tournamentTeamPlayerId)) },
+        },
+        select: { id: true, tournamentTeamId: true },
+      });
+      const allowedTT = new Set([m.team1TTId, m.team2TTId]);
+      for (const ri of rosterItems) {
+        if (!allowedTT.has(ri.tournamentTeamId)) {
+          return res.status(400).json({ error: 'Участник не из команд матча' });
+        }
+      }
+
       await prisma.$transaction(async (tx) => {
         await tx.tournamentPlayerMatch.deleteMany({ where: { matchId: id } });
         if (items.length) {
@@ -2213,19 +2290,15 @@ router.put(
       const rows = await prisma.tournamentPlayerMatch.findMany({
         where: { matchId: id },
         include: { tournamentTeamPlayer: { include: { player: true } } },
+        orderBy: [{ role: 'asc' }, { order: 'asc' }],
       });
 
-      const m = await prisma.tournamentMatch.findUnique({
-        where: { id },
-        select: { tournamentId: true },
+      const io = getIO();
+      io.to(`tmatch:${id}`).emit('tparticipants:updated', rows);
+      io.to(`tournament:${m.tournamentId}`).emit('tparticipants:updated', {
+        matchId: id,
       });
-      if (m) {
-        const io = getIO();
-        io.to(`tmatch:${id}`).emit('tparticipants:updated', rows);
-        io.to(`tournament:${m.tournamentId}`).emit('tparticipants:updated', {
-          matchId: id,
-        });
-      }
+      await emitLineupFromDB(prisma, id);
       res.json(rows);
     } catch (e) {
       console.error('PUT /tournament-matches/:id/participants', e);
@@ -2276,6 +2349,46 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       issuedByRefereeId,
     } = req.body;
 
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: matchId },
+      select: { tournamentId: true, team1TTId: true, team2TTId: true },
+    });
+    if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+    // валидация команды события
+    if (![m.team1TTId, m.team2TTId].includes(Number(tournamentTeamId))) {
+      return res.status(400).json({ error: 'Событие не этой команды матча' });
+    }
+
+    // валидации заявок (если переданы)
+    if (toInt(rosterItemId, null)) {
+      const it = await prisma.tournamentTeamPlayer.findUnique({
+        where: { id: Number(rosterItemId) },
+        select: { tournamentTeamId: true },
+      });
+      if (!it || it.tournamentTeamId !== Number(tournamentTeamId)) {
+        return res.status(400).json({ error: 'Игрок не из этой заявки' });
+      }
+    }
+    if (toInt(assistRosterItemId, null)) {
+      const it = await prisma.tournamentTeamPlayer.findUnique({
+        where: { id: Number(assistRosterItemId) },
+        select: { tournamentTeamId: true },
+      });
+      if (!it || it.tournamentTeamId !== Number(tournamentTeamId)) {
+        return res
+          .status(400)
+          .json({ error: 'Ассистент не из этой заявки/команды' });
+      }
+    }
+
+    // auto-judge: если не передали — возьмём судью группы/матча
+    const providedRefId = toInt(issuedByRefereeId, undefined);
+    const finalRefId =
+      providedRefId !== undefined
+        ? providedRefId
+        : await getDefaultRefereeIdForMatch(matchId);
+
     const created = await prisma.tournamentMatchEvent.create({
       data: {
         matchId,
@@ -2286,7 +2399,7 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
         tournamentTeamId: Number(tournamentTeamId),
         rosterItemId: toInt(rosterItemId, null),
         assistRosterItemId: toInt(assistRosterItemId, null),
-        issuedByRefereeId: toInt(issuedByRefereeId, null),
+        issuedByRefereeId: toInt(finalRefId, null),
       },
       include: {
         tournamentTeam: { include: { team: true } },
@@ -2295,45 +2408,42 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       },
     });
 
+    // апдейт статистики
     if (created.rosterItemId)
-      await incPlayerStatByRoster(created.rosterItemId, type);
-    if (created.assistRosterItemId && type === 'GOAL')
+      await incPlayerStatByRoster(created.rosterItemId, created.type);
+    if (created.type === 'ASSIST' && created.rosterItemId)
+      await incPlayerStatByRoster(created.rosterItemId, 'ASSIST');
+    if (created.assistRosterItemId && created.type === 'GOAL')
       await incPlayerStatByRoster(created.assistRosterItemId, 'ASSIST');
-    if (isGoalType(type)) await recomputeTMatchScore(matchId);
 
-    // дисциплина
+    if (isGoalType(created.type)) await recomputeTMatchScore(matchId);
     await maybeCreateSuspensionAfterEvent(created);
 
-    const m = await prisma.tournamentMatch.findUnique({
+    // если матч FINISHED — синхронизируем тоталы
+    await recalcTotalsIfFinished(matchId);
+
+    const m2 = await prisma.tournamentMatch.findUnique({
       where: { id: matchId },
       select: {
         id: true,
         tournamentId: true,
-        tieId: true,
         team1Score: true,
         team2Score: true,
       },
     });
     const io = getIO();
     io.to(`tmatch:${matchId}`).emit('tevent:created', created);
-    if (m) {
+    if (m2) {
       io.to(`tmatch:${matchId}`).emit('tmatch:score', {
         matchId,
-        team1Score: m.team1Score,
-        team2Score: m.team2Score,
+        team1Score: m2.team1Score,
+        team2Score: m2.team2Score,
       });
-      io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', {
+      io.to(`tournament:${m2.tournamentId}`).emit('tmatch:update', {
         id: matchId,
-        team1Score: m.team1Score,
-        team2Score: m.team2Score,
+        team1Score: m2.team1Score,
+        team2Score: m2.team2Score,
       });
-      if (m.tieId) {
-        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
-          id: matchId,
-          team1Score: m.team1Score,
-          team2Score: m.team2Score,
-        });
-      }
     }
 
     res.status(201).json(created);
@@ -2343,14 +2453,62 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
   }
 });
 
+// рядом с participants/events
+router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
+  try {
+    const id = Number(req.params.matchId);
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id },
+      select: { id: true, team1TTId: true, team2TTId: true },
+    });
+    if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+    const rows = await prisma.tournamentPlayerMatch.findMany({
+      where: { matchId: id },
+      include: {
+        tournamentTeamPlayer: {
+          include: { player: true, tournamentTeam: true },
+        },
+      },
+      orderBy: [{ role: 'asc' }, { order: 'asc' }, { id: 'asc' }],
+    });
+
+    const toList = (ttId) =>
+      rows
+        .filter((r) => r.tournamentTeamPlayer.tournamentTeamId === ttId)
+        .map((r) => ({
+          rosterItemId: r.tournamentTeamPlayerId,
+          playerId: r.tournamentTeamPlayer.playerId,
+          name: r.tournamentTeamPlayer.player?.name || '',
+          number: r.tournamentTeamPlayer.number,
+          position: r.position,
+          role: r.role || 'STARTER',
+          isCaptain: !!r.isCaptain,
+          order: r.order ?? 0,
+        }));
+
+    res.json({
+      matchId: id,
+      team1: { ttId: m.team1TTId, list: toList(m.team1TTId) },
+      team2: { ttId: m.team2TTId, list: toList(m.team2TTId) },
+    });
+  } catch (e) {
+    console.error('GET /tournament-matches/:id/lineup', e);
+    res.status(500).json({ error: 'Ошибка получения состава' });
+  }
+});
+
 router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.eventId);
     const old = await prisma.tournamentMatchEvent.findUnique({ where: { id } });
     if (!old) return res.status(404).json({ error: 'Событие не найдено' });
 
+    // - снимаем прошлую статистику
     if (old.rosterItemId)
       await decPlayerStatByRoster(old.rosterItemId, old.type);
+    if (old.type === 'ASSIST' && old.rosterItemId)
+      await decPlayerStatByRoster(old.rosterItemId, 'ASSIST');
     if (old.assistRosterItemId && old.type === 'GOAL')
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
 
@@ -2364,6 +2522,39 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       assistRosterItemId,
       issuedByRefereeId,
     } = req.body;
+
+    // валидации
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: old.matchId },
+      select: { team1TTId: true, team2TTId: true },
+    });
+    if (tournamentTeamId != null) {
+      if (![m.team1TTId, m.team2TTId].includes(Number(tournamentTeamId))) {
+        return res.status(400).json({ error: 'Событие не этой команды матча' });
+      }
+    }
+    const ttForCheck = Number(tournamentTeamId ?? old.tournamentTeamId);
+
+    if (toInt(rosterItemId, undefined) !== undefined) {
+      if (toInt(rosterItemId, null)) {
+        const it = await prisma.tournamentTeamPlayer.findUnique({
+          where: { id: Number(rosterItemId) },
+          select: { tournamentTeamId: true },
+        });
+        if (!it || it.tournamentTeamId !== ttForCheck)
+          return res.status(400).json({ error: 'Игрок не из этой заявки' });
+      }
+    }
+    if (toInt(assistRosterItemId, undefined) !== undefined) {
+      if (toInt(assistRosterItemId, null)) {
+        const it = await prisma.tournamentTeamPlayer.findUnique({
+          where: { id: Number(assistRosterItemId) },
+          select: { tournamentTeamId: true },
+        });
+        if (!it || it.tournamentTeamId !== ttForCheck)
+          return res.status(400).json({ error: 'Ассистент не из этой заявки' });
+      }
+    }
 
     const updated = await prisma.tournamentMatchEvent.update({
       where: { id },
@@ -2384,43 +2575,42 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       },
     });
 
+    // + накатываем новую статистику
     if (updated.rosterItemId)
       await incPlayerStatByRoster(updated.rosterItemId, updated.type);
+    if (updated.type === 'ASSIST' && updated.rosterItemId)
+      await incPlayerStatByRoster(updated.rosterItemId, 'ASSIST');
     if (updated.assistRosterItemId && updated.type === 'GOAL')
       await incPlayerStatByRoster(updated.assistRosterItemId, 'ASSIST');
+
     if (isGoalType(updated.type) || isGoalType(old.type))
       await recomputeTMatchScore(updated.matchId);
 
-    const m = await prisma.tournamentMatch.findUnique({
+    // если матч FINISHED — синхронизируем тоталы
+    await recalcTotalsIfFinished(updated.matchId);
+
+    const m2 = await prisma.tournamentMatch.findUnique({
       where: { id: updated.matchId },
       select: {
         id: true,
         tournamentId: true,
-        tieId: true,
         team1Score: true,
         team2Score: true,
       },
     });
     const io = getIO();
     io.to(`tmatch:${updated.matchId}`).emit('tevent:updated', updated);
-    if (m) {
-      io.to(`tmatch:${m.id}`).emit('tmatch:score', {
-        matchId: m.id,
-        team1Score: m.team1Score,
-        team2Score: m.team2Score,
+    if (m2) {
+      io.to(`tmatch:${m2.id}`).emit('tmatch:score', {
+        matchId: m2.id,
+        team1Score: m2.team1Score,
+        team2Score: m2.team2Score,
       });
-      io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', {
-        id: m.id,
-        team1Score: m.team1Score,
-        team2Score: m.team2Score,
+      io.to(`tournament:${m2.tournamentId}`).emit('tmatch:update', {
+        id: m2.id,
+        team1Score: m2.team1Score,
+        team2Score: m2.team2Score,
       });
-      if (m.tieId) {
-        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
-          id: m.id,
-          team1Score: m.team1Score,
-          team2Score: m.team2Score,
-        });
-      }
     }
 
     res.json(updated);
@@ -2437,18 +2627,24 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
     if (!old) return res.status(404).json({ error: 'Событие не найдено' });
 
     await prisma.tournamentMatchEvent.delete({ where: { id } });
+
     if (old.rosterItemId)
       await decPlayerStatByRoster(old.rosterItemId, old.type);
+    if (old.type === 'ASSIST' && old.rosterItemId)
+      await decPlayerStatByRoster(old.rosterItemId, 'ASSIST');
     if (old.assistRosterItemId && old.type === 'GOAL')
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
+
     if (isGoalType(old.type)) await recomputeTMatchScore(old.matchId);
+
+    // если матч FINISHED — синхронизируем тоталы
+    await recalcTotalsIfFinished(old.matchId);
 
     const m = await prisma.tournamentMatch.findUnique({
       where: { id: old.matchId },
       select: {
         id: true,
         tournamentId: true,
-        tieId: true,
         team1Score: true,
         team2Score: true,
       },
@@ -2469,13 +2665,6 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
         team1Score: m.team1Score,
         team2Score: m.team2Score,
       });
-      if (m.tieId) {
-        io.to(`ttie:${m.tieId}`).emit('tmatch:update', {
-          id: m.id,
-          team1Score: m.team1Score,
-          team2Score: m.team2Score,
-        });
-      }
     }
 
     res.json({ success: true });
@@ -2567,6 +2756,241 @@ router.post('/tournaments/:id(\\d+)/suspensions/recalc', async (req, res) => {
   } catch (e) {
     console.error('POST /tournaments/:id/suspensions/recalc', e);
     res.status(500).json({ error: 'Не удалось пересчитать дисквалификации' });
+  }
+});
+
+/* ===== COMPAT: update group ===== */
+router.patch('/tournament-groups/:groupId(\\d+)', async (req, res) => {
+  try {
+    const id = Number(req.params.groupId);
+    const { name, type, defaultRefereeId } = req.body || {};
+    const patch = {};
+    if (name !== undefined) patch.name = name;
+    if (type !== undefined) patch.type = type;
+    if (defaultRefereeId !== undefined) {
+      patch.defaultRefereeId = Number.isFinite(Number(defaultRefereeId))
+        ? Number(defaultRefereeId)
+        : null;
+    }
+
+    const g = await prisma.tournamentGroup.update({
+      where: { id },
+      data: patch,
+      include: {
+        defaultReferee: true,
+        teams: { include: { tournamentTeam: { include: { team: true } } } },
+      },
+    });
+
+    getIO().to(`tournament:${g.tournamentId}`).emit('tgroup:updated', g);
+    res.json(g);
+  } catch (e) {
+    console.error('PATCH /tournament-groups/:groupId', e);
+    res.status(400).json({ error: 'Не удалось обновить группу' });
+  }
+});
+router.put('/tournament-groups/:groupId(\\d+)', (req, res) => {
+  req.method = 'PATCH';
+  router.handle(req, res);
+});
+
+/* ===== assign referee (compat) ===== */
+router.post(
+  '/tournament-groups/:groupId(\\d+)/referee/:refId(\\d+)',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const refId = Number(req.params.refId);
+
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultRefereeId: refId },
+        select: { id: true, tournamentId: true, defaultRefereeId: true },
+      });
+
+      getIO().to(`tournament:${g.tournamentId}`).emit('tgroup:updated', g);
+      res.json(g);
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/referee/:refId', e);
+      res.status(400).json({ error: 'Не удалось назначить судью группе' });
+    }
+  }
+);
+
+/* ===== clear referee (compat) ===== */
+router.delete('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    const g = await prisma.tournamentGroup.update({
+      where: { id: groupId },
+      data: { defaultRefereeId: null },
+      select: { id: true, tournamentId: true, defaultRefereeId: true },
+    });
+
+    getIO().to(`tournament:${g.tournamentId}`).emit('tgroup:updated', g);
+    res.json(g);
+  } catch (e) {
+    console.error('DELETE /tournament-groups/:groupId/referee', e);
+    res.status(400).json({ error: 'Не удалось снять судью с группы' });
+  }
+});
+
+// ↓ рядом с другими GROUPS-роутами
+router.get('/tournament-groups/:groupId(\\d+)/matches', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+
+    const rows = await prisma.tournamentMatch.findMany({
+      where: { groupId },
+      orderBy: [{ date: 'asc' }, { id: 'asc' }],
+      include: buildTMatchInclude('team1,team2,stadium,referees,group'),
+    });
+
+    const normalized = rows.map((m) => {
+      const nm = normalizeMatch(m);
+      return {
+        ...nm,
+        team1: nm.team1TT?.team || null,
+        team2: nm.team2TT?.team || null,
+      };
+    });
+
+    res.json(normalized);
+  } catch (e) {
+    console.error('GET /tournament-groups/:groupId/matches', e);
+    res.status(500).json({ error: 'Ошибка загрузки матчей группы' });
+  }
+});
+
+// ===== standings (group table)
+router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    // по умолчанию считаем только завершённые
+    const statuses = (req.query.statuses || 'FINISHED')
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    const g = await prisma.tournamentGroup.findUnique({
+      where: { id: groupId },
+      include: {
+        tournament: true,
+        teams: { include: { tournamentTeam: { include: { team: true } } } },
+      },
+    });
+    if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+
+    // подготовим строки таблицы под все команды группы
+    const rowsMap = new Map();
+    for (const gt of g.teams) {
+      const tt = gt.tournamentTeam;
+      rowsMap.set(gt.tournamentTeamId, {
+        tournamentTeamId: gt.tournamentTeamId,
+        teamId: tt.team.id,
+        teamTitle: tt.team.title,
+        logo: (tt.team.logo?.[0]?.src || tt.team.images?.[0]) ?? null,
+        seed: tt.seed ?? null,
+        played: 0,
+        wins: 0,
+        draws: 0,
+        losses: 0,
+        goalsFor: 0,
+        goalsAgainst: 0,
+        goalDiff: 0,
+        points: 0,
+        yellow: 0,
+        red: 0,
+      });
+    }
+
+    // берём матчи группы (по умолчанию только FINISHED)
+    const matches = await prisma.tournamentMatch.findMany({
+      where: { groupId, status: { in: statuses } },
+      select: {
+        status: true,
+        team1TTId: true,
+        team2TTId: true,
+        team1Score: true,
+        team2Score: true,
+      },
+      orderBy: [{ date: 'asc' }, { id: 'asc' }],
+    });
+
+    for (const m of matches) {
+      const r1 = rowsMap.get(m.team1TTId);
+      const r2 = rowsMap.get(m.team2TTId);
+      if (!r1 || !r2) continue;
+
+      if (m.status !== 'FINISHED') continue;
+
+      const s1 = Number(m.team1Score ?? 0);
+      const s2 = Number(m.team2Score ?? 0);
+
+      r1.played++;
+      r2.played++;
+      r1.goalsFor += s1;
+      r1.goalsAgainst += s2;
+      r2.goalsFor += s2;
+      r2.goalsAgainst += s1;
+
+      if (s1 > s2) {
+        r1.wins++;
+        r2.losses++;
+        r1.points += 3;
+      } else if (s1 < s2) {
+        r2.wins++;
+        r1.losses++;
+        r2.points += 3;
+      } else {
+        r1.draws++;
+        r2.draws++;
+        r1.points += 1;
+        r2.points += 1;
+      }
+    }
+
+    // дифференциал
+    rowsMap.forEach((r) => {
+      r.goalDiff = r.goalsFor - r.goalsAgainst;
+    });
+
+    // карточки по матчам этой группы
+    const cards = await prisma.tournamentMatchEvent.groupBy({
+      by: ['tournamentTeamId', 'type'],
+      where: {
+        match: { groupId },
+        type: { in: ['YELLOW_CARD', 'RED_CARD'] },
+      },
+      _count: { _all: true },
+    });
+    for (const c of cards) {
+      const row = rowsMap.get(c.tournamentTeamId);
+      if (!row) continue;
+      if (c.type === 'YELLOW_CARD') row.yellow += c._count._all;
+      if (c.type === 'RED_CARD') row.red += c._count._all;
+    }
+
+    // сортировка
+    const table = Array.from(rowsMap.values()).sort(
+      (a, b) =>
+        b.points - a.points ||
+        b.goalDiff - a.goalDiff ||
+        b.goalsFor - a.goalsFor ||
+        (a.seed ?? 1e9) - (b.seed ?? 1e9) ||
+        String(a.teamTitle).localeCompare(String(b.teamTitle), 'ru')
+    );
+    table.forEach((r, i) => (r.place = i + 1));
+
+    res.json({
+      groupId,
+      tournamentId: g.tournamentId,
+      rules: { pointsPerWin: 3, pointsPerDraw: 1, pointsPerLoss: 0 },
+      table,
+    });
+  } catch (e) {
+    console.error('GET /tournament-groups/:groupId/standings', e);
+    res.status(500).json({ error: 'Ошибка расчёта таблицы группы' });
   }
 });
 
