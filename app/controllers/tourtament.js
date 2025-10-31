@@ -2454,6 +2454,7 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
 });
 
 // рядом с participants/events
+// рядом с participants/events
 router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
@@ -2463,7 +2464,8 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
     });
     if (!m) return res.status(404).json({ error: 'Матч не найден' });
 
-    const rows = await prisma.tournamentPlayerMatch.findMany({
+    // 1) пробуем участников матча
+    let rows = await prisma.tournamentPlayerMatch.findMany({
       where: { matchId: id },
       include: {
         tournamentTeamPlayer: {
@@ -2473,15 +2475,49 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
       orderBy: [{ role: 'asc' }, { order: 'asc' }, { id: 'asc' }],
     });
 
+    // 2) фолбэк: формируем из заявки TT, если участников нет
+    if (!rows.length) {
+      const ttIds = [m.team1TTId, m.team2TTId]
+        .map(Number)
+        .filter(Number.isFinite);
+
+      if (ttIds.length) {
+        const roster = await prisma.tournamentTeamPlayer.findMany({
+          where: { tournamentTeamId: { in: ttIds } },
+          include: { player: true, tournamentTeam: true },
+          orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
+        });
+
+        rows = roster.map((r) => ({
+          matchId: id,
+          tournamentTeamPlayerId: r.id,
+          role: r.role || 'STARTER',
+          position: r.position || null,
+          isCaptain: false,
+          order: r.number ?? 0,
+          tournamentTeamPlayer: {
+            id: r.id,
+            number: r.number,
+            playerId: r.playerId,
+            player: r.player,
+            tournamentTeamId: r.tournamentTeamId,
+          },
+        }));
+      }
+    }
+
     const toList = (ttId) =>
       rows
-        .filter((r) => r.tournamentTeamPlayer.tournamentTeamId === ttId)
+        .filter(
+          (r) =>
+            Number(r.tournamentTeamPlayer.tournamentTeamId) === Number(ttId)
+        )
         .map((r) => ({
           rosterItemId: r.tournamentTeamPlayerId,
           playerId: r.tournamentTeamPlayer.playerId,
           name: r.tournamentTeamPlayer.player?.name || '',
           number: r.tournamentTeamPlayer.number,
-          position: r.position,
+          position: r.position || null,
           role: r.role || 'STARTER',
           isCaptain: !!r.isCaptain,
           order: r.order ?? 0,
