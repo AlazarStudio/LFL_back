@@ -12,6 +12,15 @@ const lineups = new Map(); // matchId -> { team1:{ttId,list}, team2:{ttId,list} 
 /* ===================== УТИЛИТЫ ===================== */
 const nowMs = () => Date.now();
 
+const DEFAULT_FLAGS = {
+  OpenScore: false,
+  OpenWaiting: false,
+  OpenBreak: false,
+  ShowSostavTeam1: false,
+  ShowSostavTeam2: false,
+  ShowPlug: false,
+};
+
 const normClock = (p) => {
   const now = nowMs();
   const halfMinutes = Number(p?.halfMinutes ?? 45);
@@ -31,6 +40,18 @@ const normClock = (p) => {
     addedSec: Math.max(0, Number(p?.addedSec ?? 0)),
   };
 };
+
+const getOverlay = (matchId) => {
+  const id = Number(matchId);
+  return { ...DEFAULT_FLAGS, ...(overlays.get(id) || {}) };
+};
+
+const onlyKnownFlags = (obj = {}) =>
+  Object.fromEntries(
+    Object.entries(obj)
+      .filter(([k]) => k in DEFAULT_FLAGS)
+      .map(([k, v]) => [k, !!v])
+  );
 
 /* ===================== ЛАЙНАП И ЧАСЫ ИЗ БД ===================== */
 async function buildLineupFromDB(prisma, matchId) {
@@ -183,6 +204,34 @@ export function initSocket(httpServer, { prisma } = {}) {
       }
     });
 
+    /* ====== Оверлеи ====== */
+    socket.on('tmatch:overlay:get', ({ matchId }, ack) => {
+      const st = getOverlay(matchId);
+      ack && ack(st);
+      socket.emit('tmatch:overlay', st);
+    });
+
+    socket.on('tmatch:overlay:set', (payload, ack) => {
+      try {
+        const id = Number(payload?.matchId);
+        if (!id) throw new Error('matchId required');
+
+        const prev = getOverlay(id);
+        const patch = onlyKnownFlags(payload);
+
+        // // взаимоисключение составов (опционально):
+        // if (patch.ShowSostavTeam1) patch.ShowSostavTeam2 = false;
+        // if (patch.ShowSostavTeam2) patch.ShowSostavTeam1 = false;
+
+        const next = { ...prev, ...patch };
+        overlays.set(id, next);
+        io.to(`tmatch:${id}`).emit('tmatch:overlay', next);
+        ack && ack(next);
+      } catch (e) {
+        ack && ack({ error: String(e) });
+      }
+    });
+
     /* ====== Составы ====== */
     socket.on('tmatch:lineup:get', async ({ matchId }) => {
       const id = Number(matchId);
@@ -216,16 +265,24 @@ export function setClock(matchId, statePatch) {
 /* ===== оверлеи ===== */
 export function setOverlayFlags(matchId, patch) {
   const id = Number(matchId);
-  const prev = overlays.get(id) || {};
-  const next = { ...prev, ...patch };
+  const prev = getOverlay(id);
+  const next = { ...prev, ...onlyKnownFlags(patch) };
   overlays.set(id, next);
   getIO().to(`tmatch:${id}`).emit('tmatch:overlay', next);
   return next;
 }
 
+export function resetOverlay(matchId) {
+  const id = Number(matchId);
+  const st = { ...DEFAULT_FLAGS };
+  overlays.set(id, st);
+  getIO().to(`tmatch:${id}`).emit('tmatch:overlay', st);
+  return st;
+}
+
 /* ===== лайнапы: публичная функция для роутов ===== */
 export async function emitLineupFromDB(prisma, matchId) {
-  const payload = await buildLineupFromDB(prisma, matchId);
+  const payload = await buildLineupFromDB(prisma, Number(matchId));
   if (!payload) return null;
   lineups.set(Number(matchId), payload);
   getIO()
