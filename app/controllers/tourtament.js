@@ -2225,45 +2225,45 @@ router.get(
   '/tournament-matches/:matchId(\\d+)/participants',
   async (req, res) => {
     try {
-      // ДОБАВЬ в существующий GET /participants:
-      const flat = String(req.query.flat || 'false') === 'true';
-      if (flat) {
-        return res.json(
-          rows.map((r) => {
-            const p = r.tournamentTeamPlayer.player || {};
-            return {
-              id: r.id,
-              matchId: r.matchId,
-              ttId: r.tournamentTeamPlayer.tournamentTeamId,
-              playerId: r.tournamentTeamPlayer.playerId,
-              name: p.name || '',
-              role: r.role || 'STARTER',
-              isCaptain: !!r.isCaptain,
-              position:
-                r.position ??
-                r.tournamentTeamPlayer.position ??
-                p.position ??
-                null,
-              number:
-                r.order ?? r.tournamentTeamPlayer.number ?? p.number ?? null,
-              photo:
-                Array.isArray(p.images) && p.images.length ? p.images[0] : null,
-              photos: Array.isArray(p.images) ? p.images : [],
-            };
-          })
-        );
-      }
-
       const id = Number(req.params.matchId);
       const rows = await prisma.tournamentPlayerMatch.findMany({
         where: { matchId: id },
         include: { tournamentTeamPlayer: { include: { player: true } } },
         orderBy: [{ role: 'asc' }, { order: 'asc' }],
       });
-      res.json(rows);
+
+      const flat = String(req.query.flat || 'false') === 'true';
+      if (flat) {
+        const flatRows = rows.map((r) => {
+          const p = r.tournamentTeamPlayer.player || {};
+          const photos = Array.isArray(p.images) ? p.images : [];
+          return {
+            id: r.id,
+            matchId: r.matchId,
+            ttId: r.tournamentTeamPlayer.tournamentTeamId,
+            playerId: r.tournamentTeamPlayer.playerId,
+            name: p.name || '',
+            role: r.role || 'STARTER',
+            isCaptain: !!r.isCaptain,
+            position:
+              r.position ??
+              r.tournamentTeamPlayer.position ??
+              p.position ??
+              null,
+            number:
+              r.order ?? r.tournamentTeamPlayer.number ?? p.number ?? null,
+            photo: photos.length ? photos[0] : null,
+            photos, // для совместимости с lineup
+            images: photos, // если фронт ждёт `images`
+          };
+        });
+        return res.json(flatRows);
+      }
+
+      return res.json(rows);
     } catch (e) {
       console.error('GET /tournament-matches/:id/participants', e);
-      res.status(500).json({ error: 'Ошибка загрузки участников' });
+      return res.status(500).json({ error: 'Ошибка загрузки участников' });
     }
   }
 );
@@ -2531,15 +2531,16 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
         tournamentTeamPlayerId: r.id,
         role: r.role || 'STARTER',
         position: r.position || null,
-        isCaptain: r.id === capMap.get(r.tournamentTeamId),
+        isCaptain: !!(r.tournamentTeam?.captainRosterItemId === r.id),
         order: r.number ?? 0,
         tournamentTeamPlayer: {
           id: r.id,
           number: r.number,
-          position: r.position,
+          position: r.position ?? null,
           playerId: r.playerId,
           player: r.player, // есть .images[]
           tournamentTeamId: r.tournamentTeamId,
+          tournamentTeam: r.tournamentTeam,
         },
       }));
     }

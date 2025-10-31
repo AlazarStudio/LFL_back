@@ -82,7 +82,7 @@ async function buildLineupFromDB(prisma, matchId) {
   if (!rows.length) {
     const roster = await prisma.tournamentTeamPlayer.findMany({
       where: { tournamentTeamId: { in: [m.team1TTId, m.team2TTId] } },
-      include: { player: true },
+      include: { player: true, tournamentTeam: true },
       orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
     });
     rows = roster.map((r) => ({
@@ -90,14 +90,17 @@ async function buildLineupFromDB(prisma, matchId) {
       tournamentTeamPlayerId: r.id,
       role: r.role || 'STARTER',
       position: r.position || null,
-      isCaptain: false,
+      // капитан из заявки:
+      isCaptain: !!(r.tournamentTeam?.captainRosterItemId === r.id),
       order: r.number ?? 0,
       tournamentTeamPlayer: {
         id: r.id,
         number: r.number,
         playerId: r.playerId,
+        position: r.position ?? null,
         player: r.player,
         tournamentTeamId: r.tournamentTeamId,
+        tournamentTeam: r.tournamentTeam,
       },
     }));
   }
@@ -105,16 +108,34 @@ async function buildLineupFromDB(prisma, matchId) {
   const toList = (ttId) =>
     rows
       .filter((r) => r.tournamentTeamPlayer.tournamentTeamId === ttId)
-      .map((r) => ({
-        rosterItemId: r.tournamentTeamPlayerId,
-        playerId: r.tournamentTeamPlayer.playerId,
-        name: r.tournamentTeamPlayer.player?.name || '',
-        number: r.tournamentTeamPlayer.number,
-        position: r.position || null,
-        role: r.role || 'STARTER',
-        isCaptain: !!r.isCaptain,
-        order: r.order ?? 0,
-      }));
+      .map((r) => {
+        const player = r.tournamentTeamPlayer?.player;
+        const photo =
+          Array.isArray(player?.images) && player.images.length
+            ? player.images[0]
+            : null;
+        const capId =
+          r.tournamentTeamPlayer?.tournamentTeam?.captainRosterItemId;
+        return {
+          rosterItemId: r.tournamentTeamPlayerId,
+          playerId: r.tournamentTeamPlayer.playerId,
+          name: r.tournamentTeamPlayer.player?.name || '',
+          number: r.tournamentTeamPlayer.number,
+
+          // приоритет позиции: участник матча → заявка:
+          position: (r.position ?? r.tournamentTeamPlayer?.position) || null,
+          role: r.role || 'STARTER',
+
+          // приоритет флага: участник матча → капитан из заявки
+          isCaptain: !!(
+            r.isCaptain ||
+            (capId && capId === r.tournamentTeamPlayerId)
+          ),
+          order: r.order ?? 0,
+          photo,
+          images: Array.isArray(player?.images) ? player.images : [],
+        };
+      });
 
   return {
     matchId: id,
