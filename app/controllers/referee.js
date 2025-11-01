@@ -52,6 +52,16 @@ const parseRoles = (req) => {
    ========================================================= */
 router.get('/', async (req, res) => {
   try {
+    const safeJSON = (v, fb) => {
+      try {
+        return v ? JSON.parse(String(v)) : fb;
+      } catch {
+        return fb;
+      }
+    };
+    const bool = (v) =>
+      ['true', '1', 'yes', 'on'].includes(String(v).toLowerCase());
+
     const range = safeJSON(req.query.range, [0, 9999]);
     const sort = safeJSON(req.query.sort, ['id', 'ASC']);
     const filter = safeJSON(req.query.filter, {});
@@ -68,19 +78,17 @@ router.get('/', async (req, res) => {
         : { [sortField]: sortOrder };
 
     const AND = [];
-
     if (Array.isArray(filter.id) && filter.id.length) {
       AND.push({ id: { in: filter.id.map(Number).filter(Number.isFinite) } });
     }
     if (typeof filter.q === 'string' && filter.q.trim()) {
-      const q = filter.q.trim();
-      AND.push({ name: { contains: q, mode: 'insensitive' } });
+      AND.push({ name: { contains: filter.q.trim(), mode: 'insensitive' } });
     }
     if (typeof filter.name === 'string' && filter.name.trim()) {
       AND.push({ name: { contains: filter.name.trim(), mode: 'insensitive' } });
     }
 
-    // фильтры по назначенным матчам
+    // Фильтры по лиговым назначениями (через relation matchRefs)
     const matchSubWhere = {};
     if (filter.leagueId != null && Number.isFinite(Number(filter.leagueId))) {
       matchSubWhere.match = {
@@ -88,9 +96,7 @@ router.get('/', async (req, res) => {
         leagueId: Number(filter.leagueId),
       };
     }
-    if (filter.role) {
-      matchSubWhere.role = filter.role;
-    }
+    if (filter.role) matchSubWhere.role = filter.role;
     if (filter.date_gte || filter.date_lte) {
       matchSubWhere.match = {
         ...(matchSubWhere.match || {}),
@@ -103,31 +109,70 @@ router.get('/', async (req, res) => {
     if (Object.keys(matchSubWhere).length) {
       AND.push({ matchRefs: { some: matchSubWhere } });
     }
+
+    // hasMatches — учитываем и турнирные через предварительный список id из groupBy
+    let tAssignedIds = null;
     if (filter.hasMatches != null) {
-      AND.push(
-        bool(filter.hasMatches)
-          ? { matchRefs: { some: {} } }
-          : { matchRefs: { none: {} } }
-      );
+      const tAgg = await prisma.tournamentMatchReferee.groupBy({
+        by: ['refereeId'],
+        _count: { _all: true },
+      });
+      tAssignedIds = new Set(tAgg.map((r) => r.refereeId));
+      if (bool(filter.hasMatches)) {
+        AND.push({
+          OR: [{ matchRefs: { some: {} } }, { id: { in: [...tAssignedIds] } }],
+        });
+      } else {
+        AND.push({
+          AND: [
+            { matchRefs: { none: {} } },
+            { id: { notIn: [...tAssignedIds] } },
+          ],
+        });
+      }
     }
 
     const where = AND.length ? { AND } : undefined;
 
+    // Основной список (только лиговый _count — он гарантированно есть)
     const [rows, total] = await Promise.all([
       prisma.referee.findMany({
         skip: start,
         take,
         where,
         orderBy,
-        include: {
-          _count: { select: { matchRefs: true } },
-        },
+        include: { _count: { select: { matchRefs: true } } },
       }),
       prisma.referee.count({ where }),
     ]);
 
-    setRange(res, 'referees', start, rows.length, total);
-    res.json(rows);
+    // Подтягиваем турнирные количества для этих ID
+    const ids = rows.map((r) => r.id);
+    const tCounts = ids.length
+      ? await prisma.tournamentMatchReferee.groupBy({
+          by: ['refereeId'],
+          where: { refereeId: { in: ids } },
+          _count: { _all: true },
+        })
+      : [];
+    const tMap = new Map(tCounts.map((r) => [r.refereeId, r._count._all]));
+
+    // Сливаем в _totals (league + tournament + total)
+    const out = rows.map((r) => {
+      const league = r._count?.matchRefs ?? 0;
+      const tournament = tMap.get(r.id) ?? 0;
+      return {
+        ...r,
+        _totals: { league, tournament, total: league + tournament },
+      };
+    });
+
+    res.setHeader(
+      'Content-Range',
+      `referees ${start}-${start + rows.length - 1}/${total}`
+    );
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
+    res.json(out);
   } catch (e) {
     console.error('GET /referees', e);
     res.status(500).json({ error: 'Ошибка загрузки судей' });
@@ -162,12 +207,20 @@ router.get('/:id(\\d+)', async (req, res) => {
     const id = Number(req.params.id);
     const item = await prisma.referee.findUnique({
       where: { id },
-      include: {
-        _count: { select: { matchRefs: true } },
-      },
+      include: { _count: { select: { matchRefs: true } } },
     });
     if (!item) return res.status(404).json({ error: 'Not found' });
-    res.json(item);
+
+    const tCount = await prisma.tournamentMatchReferee.count({
+      where: { refereeId: id },
+    });
+    const league = item._count?.matchRefs ?? 0;
+    const tournament = tCount ?? 0;
+
+    res.json({
+      ...item,
+      _totals: { league, tournament, total: league + tournament },
+    });
   } catch (e) {
     console.error('GET /referees/:id', e);
     res.status(500).json({ error: 'Ошибка' });
@@ -176,14 +229,12 @@ router.get('/:id(\\d+)', async (req, res) => {
 
 /* =========================================================
    STATS  GET /referees/:id/stats
-   + карточки (yellow/red), опциональные фильтры: onlyMain=true (по умолчанию),
-     roles=["MAIN","FOURTH"], date_gte/lte, leagueId, tournamentId
    ========================================================= */
 router.get('/:id(\\d+)/stats', async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // ---- существующие агрегаты по лигам ----
+    // ---- агрегаты по лигам ----
     const byLeague = await prisma.matchReferee.groupBy({
       by: ['role', 'matchId'],
       where: { refereeId: id },
@@ -209,7 +260,7 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
         (leagueAgg[lid].byRole[r.role || 'UNKNOWN'] || 0) + 1;
     });
 
-    // ---- существующие агрегаты по турнирам ----
+    // ---- агрегаты по турнирам ----
     const byTournamentMatch = await prisma.tournamentMatchReferee.groupBy({
       by: ['role', 'matchId'],
       where: { refereeId: id },
@@ -332,7 +383,6 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
 
 /* =========================================================
    CARDS-ONLY  GET /referees/:id/cards
-   Параметры: onlyMain (true по умолчанию), roles, date_gte/lte, leagueId, tournamentId
    ========================================================= */
 router.get('/:id(\\d+)/cards', async (req, res) => {
   try {
@@ -660,7 +710,7 @@ router.delete('/:id(\\d+)/assign', async (req, res) => {
 });
 
 /* =========================================================
-   LEADERBOARD: топ судей по числу матчей (с учётом фильтров)
+   LEADERBOARD: топ судей по числу матчей (лига+турниры)
    GET /referees/leaderboard/top?leagueId=&date_gte=&date_lte=&limit=20
    ========================================================= */
 router.get('/leaderboard/top', async (req, res) => {
@@ -670,25 +720,62 @@ router.get('/leaderboard/top', async (req, res) => {
     const date_gte = toDate(req.query.date_gte);
     const date_lte = toDate(req.query.date_lte);
 
-    const whereRef = {};
-    if (leagueId != null || date_gte || date_lte) {
-      whereRef.matchRefs = {
-        some: {
-          match: {
-            leagueId: leagueId ?? undefined,
-            date: { gte: date_gte, lte: date_lte },
-          },
+    // считаем отдельно лига/турнир, затем склеиваем
+    const leagueAgg = await prisma.matchReferee.groupBy({
+      by: ['refereeId'],
+      where: {
+        match: {
+          leagueId: leagueId ?? undefined,
+          date: { gte: date_gte, lte: date_lte },
         },
-      };
+      },
+      _count: { _all: true },
+    });
+    const tournAgg = await prisma.tournamentMatchReferee.groupBy({
+      by: ['refereeId'],
+      where: {
+        match: {
+          date: { gte: date_gte, lte: date_lte },
+        },
+      },
+      _count: { _all: true },
+    });
+
+    const map = new Map();
+    for (const r of leagueAgg) {
+      map.set(r.refereeId, { league: r._count._all, tournament: 0 });
+    }
+    for (const r of tournAgg) {
+      const prev = map.get(r.refereeId) || { league: 0, tournament: 0 };
+      prev.tournament = r._count._all;
+      map.set(r.refereeId, prev);
     }
 
-    const rows = await prisma.referee.findMany({
-      where: Object.keys(whereRef).length ? whereRef : undefined,
-      orderBy: { matchRefs: { _count: 'desc' } },
-      take: limit,
-      include: { _count: { select: { matchRefs: true } } },
+    const items = [...map.entries()].map(([id, cnt]) => ({
+      id,
+      league: cnt.league,
+      tournament: cnt.tournament,
+      total: cnt.league + cnt.tournament,
+    }));
+
+    items.sort((a, b) => b.total - a.total);
+    const top = items.slice(0, limit);
+    const ids = top.map((i) => i.id);
+
+    const refs = await prisma.referee.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, name: true },
     });
-    res.json(rows);
+    const refMap = new Map(refs.map((r) => [r.id, r]));
+
+    const out = top.map((i) => ({
+      id: i.id,
+      name: refMap.get(i.id)?.name || `#${i.id}`,
+      _count: { matchRefs: i.league, tournamentMatchRefs: i.tournament },
+      _totals: { league: i.league, tournament: i.tournament, total: i.total },
+    }));
+
+    res.json(out);
   } catch (e) {
     console.error('GET /referees/leaderboard/top', e);
     res.status(500).json({ error: 'Ошибка загрузки топа судей' });

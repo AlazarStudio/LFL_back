@@ -8,15 +8,61 @@ const router = Router();
 const prisma = new PrismaClient();
 
 /* =========================================================
-   helpers
+   HELPERS
 ========================================================= */
 
 const FIN = 'FINISHED';
 const isFinished = (s) => String(s).toUpperCase() === String(FIN).toUpperCase();
 
+const safeJSON = (v, fb) => {
+  try {
+    return v ? JSON.parse(String(v)) : fb;
+  } catch {
+    return fb;
+  }
+};
+const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
+const toDate = (v, d = undefined) => (v ? new Date(v) : d);
+const setRange = (res, name, start, count, total) => {
+  const from = total === 0 ? 0 : start;
+  const to = total === 0 ? 0 : start + Math.max(0, count - 1);
+  res.setHeader('Content-Range', `${name} ${from}-${to}/${total}`);
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
+};
+const toStrArr = (val) => {
+  const arr = Array.isArray(val) ? val : [val];
+  return arr
+    .filter(Boolean)
+    .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
+    .filter(Boolean);
+};
+// нормализация булевых из любых форм
+const toBool = (v, d = false) => {
+  if (v === undefined) return d;
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(s)) return true;
+    if (['false', '0', 'no', 'n', 'off', ''].includes(s)) return false;
+  }
+  return d;
+};
+
+const isGoalType = (t) => t === 'GOAL' || t === 'PENALTY_SCORED';
+
+const STARTERS_BY_FORMAT = {
+  F5x5: 5,
+  F6x6: 6,
+  F7x7: 7,
+  F8x8: 8,
+  F9x9: 9,
+  F10x10: 10,
+  F11x11: 11,
+};
+
 /* ---------- totals: игры/победы/голы/кол-во турниров у команды ---------- */
 async function recalcTeamTotals(teamId) {
-  // все заявки этой команды в турнирах
   const tts = await prisma.tournamentTeam.findMany({
     where: { teamId },
     select: { id: true, tournamentId: true },
@@ -39,7 +85,6 @@ async function recalcTeamTotals(teamId) {
 
   const ttIds = tts.map((t) => t.id);
 
-  // все завершённые матчи с участием этих заявок
   const matches = await prisma.tournamentMatch.findMany({
     where: {
       status: 'FINISHED',
@@ -93,40 +138,6 @@ async function recalcTotalsIfFinished(matchId) {
   ]);
 }
 
-const safeJSON = (v, fb) => {
-  try {
-    return v ? JSON.parse(String(v)) : fb;
-  } catch {
-    return fb;
-  }
-};
-const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
-const toDate = (v, d = undefined) => (v ? new Date(v) : d);
-const setRange = (res, name, start, count, total) => {
-  const from = total === 0 ? 0 : start;
-  const to = total === 0 ? 0 : start + Math.max(0, count - 1);
-  res.setHeader('Content-Range', `${name} ${from}-${to}/${total}`);
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
-};
-const toStrArr = (val) => {
-  const arr = Array.isArray(val) ? val : [val];
-  return arr
-    .filter(Boolean)
-    .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
-    .filter(Boolean);
-};
-const isGoalType = (t) => t === 'GOAL' || t === 'PENALTY_SCORED';
-
-const STARTERS_BY_FORMAT = {
-  F5x5: 5,
-  F6x6: 6,
-  F7x7: 7,
-  F8x8: 8,
-  F9x9: 9,
-  F10x10: 10,
-  F11x11: 11,
-};
-
 /* ---------- default match referee helper (MAIN first) ---------- */
 async function getDefaultRefereeIdForMatch(matchId) {
   const m = await prisma.tournamentMatch.findUnique({
@@ -143,7 +154,6 @@ async function getDefaultRefereeIdForMatch(matchId) {
     if (g?.defaultRefereeId) return g.defaultRefereeId;
   }
 
-  // сначала ищем MAIN; если нет — любого
   const main = await prisma.tournamentMatchReferee.findFirst({
     where: { matchId, role: 'MAIN' },
     orderBy: { matchId: 'asc' },
@@ -158,7 +168,6 @@ async function getDefaultRefereeIdForMatch(matchId) {
 }
 
 /* -------------------- include builders -------------------- */
-// вместо прежних buildTournamentInclude / buildTMatchInclude
 const buildTournamentInclude = (p) => {
   const parts = String(p || '')
     .split(',')
@@ -333,6 +342,72 @@ async function recomputeTMatchScore(matchId) {
       where: { id: matchId },
       data: { team1Score, team2Score },
     });
+  });
+}
+
+/* -------------------- matchesPlayed из заявки матча -------------------- */
+async function getMatchParticipantPlayerIdsTX(tx, matchId) {
+  const rows = await tx.tournamentPlayerMatch.findMany({
+    where: { matchId },
+    select: { tournamentTeamPlayer: { select: { playerId: true } } },
+  });
+  return Array.from(
+    new Set(rows.map((r) => r.tournamentTeamPlayer.playerId).filter(Boolean))
+  );
+}
+
+async function recomputeMatchesPlayedTX(
+  tx,
+  playerIds = null,
+  onlyFinished = true
+) {
+  const where = {
+    ...(onlyFinished ? { match: { status: 'FINISHED' } } : {}),
+    ...(playerIds
+      ? { tournamentTeamPlayer: { playerId: { in: playerIds } } }
+      : {}),
+  };
+  const pairs = await tx.tournamentPlayerMatch.findMany({
+    where,
+    select: {
+      matchId: true,
+      tournamentTeamPlayer: { select: { playerId: true } },
+    },
+  });
+
+  const byPid = new Map(); // pid -> Set(matchId)
+  for (const r of pairs) {
+    const pid = r.tournamentTeamPlayer.playerId;
+    if (!pid) continue;
+    if (!byPid.has(pid)) byPid.set(pid, new Set());
+    byPid.get(pid).add(r.matchId);
+  }
+
+  for (const [pid, set] of byPid) {
+    const cnt = set.size;
+    await tx.playerStat.upsert({
+      where: { playerId: pid },
+      update: { matchesPlayed: cnt },
+      create: {
+        playerId: pid,
+        matchesPlayed: cnt,
+        goals: 0,
+        assists: 0,
+        yellow_cards: 0,
+        red_cards: 0,
+      },
+    });
+  }
+}
+
+async function recomputeMatchesPlayedForMatch(
+  matchId,
+  { onlyFinished = true } = {}
+) {
+  await prisma.$transaction(async (tx) => {
+    const pids = await getMatchParticipantPlayerIdsTX(tx, matchId);
+    if (!pids.length) return;
+    await recomputeMatchesPlayedTX(tx, pids, onlyFinished);
   });
 }
 
@@ -523,12 +598,8 @@ async function publishRosterToMatch(matchId, ttId, roleFilter = 'ALL') {
     allowed = allowed.slice(0, maxStarters);
   }
 
-  // полное удаление участников этой команды в матче
   await prisma.tournamentPlayerMatch.deleteMany({
-    where: {
-      matchId: m.id,
-      tournamentTeamPlayer: { tournamentTeamId: ttId },
-    },
+    where: { matchId: m.id, tournamentTeamPlayer: { tournamentTeamId: ttId } },
   });
 
   if (allowed.length) {
@@ -663,13 +734,12 @@ router.post('/tournaments', async (req, res) => {
         startDate: toDate(startDate, new Date()),
         endDate: toDate(endDate, null),
         registrationDeadline: toDate(registrationDeadline, null),
-        disciplineEnabled: !!disciplineEnabled,
+        disciplineEnabled: toBool(disciplineEnabled, false),
         disciplinePeriod: disciplinePeriod ?? 'TOURNAMENT',
         yellowToSuspend: toInt(yellowToSuspend, 2),
         redToSuspend: toInt(redToSuspend, 1),
         suspendGames: toInt(suspendGames, 1),
-        autoPublishParticipants:
-          autoPublishParticipants == null ? true : !!autoPublishParticipants,
+        autoPublishParticipants: toBool(autoPublishParticipants, true),
       },
     });
 
@@ -684,6 +754,10 @@ router.post('/tournaments', async (req, res) => {
 router.patch('/tournaments/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: 'Некорректный id' });
+    }
+
     const {
       title,
       season,
@@ -704,20 +778,22 @@ router.patch('/tournaments/:id(\\d+)', async (req, res) => {
     } = req.body;
 
     const patch = {};
-    if (title !== undefined) patch.title = title;
-    if (season !== undefined) patch.season = season;
-    if (city !== undefined) patch.city = city;
+    if (title !== undefined) patch.title = String(title).trim();
+    if (season !== undefined) patch.season = String(season).trim();
+    if (city !== undefined) patch.city = String(city).trim();
     if (images !== undefined) patch.images = toStrArr(images);
     if (format !== undefined) patch.format = format;
+
     if (halfMinutes !== undefined) patch.halfMinutes = toInt(halfMinutes, 45);
     if (halves !== undefined) patch.halves = toInt(halves, 2);
-    if (startDate !== undefined) patch.startDate = toDate(startDate);
+
+    if (startDate !== undefined) patch.startDate = toDate(startDate, null);
     if (endDate !== undefined) patch.endDate = toDate(endDate, null);
     if (registrationDeadline !== undefined)
       patch.registrationDeadline = toDate(registrationDeadline, null);
 
     if (disciplineEnabled !== undefined)
-      patch.disciplineEnabled = !!disciplineEnabled;
+      patch.disciplineEnabled = toBool(disciplineEnabled, false);
     if (disciplinePeriod !== undefined)
       patch.disciplinePeriod = disciplinePeriod;
     if (yellowToSuspend !== undefined)
@@ -725,7 +801,7 @@ router.patch('/tournaments/:id(\\d+)', async (req, res) => {
     if (redToSuspend !== undefined) patch.redToSuspend = toInt(redToSuspend, 1);
     if (suspendGames !== undefined) patch.suspendGames = toInt(suspendGames, 1);
     if (autoPublishParticipants !== undefined)
-      patch.autoPublishParticipants = !!autoPublishParticipants;
+      patch.autoPublishParticipants = toBool(autoPublishParticipants, true);
 
     const updated = await prisma.tournament.update({
       where: { id },
@@ -736,7 +812,7 @@ router.patch('/tournaments/:id(\\d+)', async (req, res) => {
     res.json(updated);
   } catch (e) {
     console.error('PATCH /tournaments/:id', e);
-    res.status(400).json({ error: 'Ошибка обновления турнира' });
+    res.status(400).json({ error: e?.message || 'Ошибка обновления турнира' });
   }
 });
 router.put('/tournaments/:id(\\d+)', (req, res) => {
@@ -748,17 +824,12 @@ router.delete('/tournaments/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // сохраним команды, чтобы пересчитать после удаления турнира
     const teamIds = await prisma.tournamentTeam
-      .findMany({
-        where: { tournamentId: id },
-        select: { teamId: true },
-      })
+      .findMany({ where: { tournamentId: id }, select: { teamId: true } })
       .then((x) => Array.from(new Set(x.map((r) => r.teamId))));
 
     await prisma.tournament.delete({ where: { id } });
 
-    // пересчёт totals тем, кто участвовал в этом турнире
     if (teamIds.length) {
       await Promise.all(teamIds.map((tid) => recalcTeamTotals(tid)));
     }
@@ -806,7 +877,6 @@ router.post(
       const teamId = Number(req.params.teamId);
       const seed = toInt(req.body?.seed, null);
 
-      // проверим, что команда существует
       const team = await prisma.team.findUnique({ where: { id: teamId } });
       if (!team) return res.status(404).json({ error: 'Команда не найдена' });
 
@@ -816,7 +886,6 @@ router.post(
         create: { tournamentId, teamId, seed },
       });
 
-      // ← пересчёт totals: турниры++ (по заявкам), игры/голы не меняются
       await recalcTeamTotals(teamId);
 
       getIO()
@@ -840,7 +909,6 @@ router.delete(
         where: { tournamentId_teamId: { tournamentId, teamId } },
       });
 
-      // ← пересчёт totals: уменьшится количество турниров
       await recalcTeamTotals(teamId);
 
       getIO()
@@ -901,7 +969,6 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     });
     if (!tt) return res.status(404).json({ error: 'TournamentTeam не найден' });
 
-    // валидация «игрок из этой команды»
     for (const it of items) {
       const pid = Number(it.playerId);
       const p = await prisma.player.findUnique({
@@ -1236,10 +1303,7 @@ router.put('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
 
     if (apply && refereeId) {
       const ids = await prisma.tournamentMatch
-        .findMany({
-          where: { groupId },
-          select: { id: true },
-        })
+        .findMany({ where: { groupId }, select: { id: true } })
         .then((r) => r.map((x) => x.id));
 
       if (ids.length) {
@@ -1247,7 +1311,6 @@ router.put('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
           data: ids.map((id) => ({ matchId: id, refereeId, role: 'MAIN' })),
           skipDuplicates: true,
         });
-        // проставим судью в событиях без выдавшего
         await prisma.tournamentMatchEvent.updateMany({
           where: { matchId: { in: ids }, issuedByRefereeId: null },
           data: { issuedByRefereeId: refereeId },
@@ -1263,7 +1326,6 @@ router.put('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
 });
 
 router.post('/tournament-groups/:groupId(\\d+)/referee', (req, res) => {
-  // просто прокидываем в уже реализованный PUT-хендлер
   req.method = 'PUT';
   router.handle(req, res);
 });
@@ -1318,7 +1380,6 @@ router.post(
       const groupId = Number(req.params.groupId);
       const tournamentTeamId = Number(req.params.ttId);
 
-      // валидируем принадлежность TT турниру группы
       const g = await prisma.tournamentGroup.findUnique({
         where: { id: groupId },
         select: { tournamentId: true },
@@ -1362,17 +1423,16 @@ router.delete(
   }
 );
 
-// генерация «каждый с каждым» только для ROUND1/ROUND2 (1 или 2 круга подряд)
-// генерация «каждый с каждым» c днями недели и лимитом матчей в день
+// GENERATE round-robin
 router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
   try {
     const groupId = Number(req.params.groupId);
     const {
-      rounds, // 1|2 (если не передан — из типа группы)
-      dateStart = null, // 'YYYY-MM-DDTHH:mm'
-      perDay = 2, // Сколько матчей в день
-      daysOfWeek = [6, 7], // 1=Пн ... 7=Вс
-      stadiumId: rawGenStadiumId = null, // опционально общий стадион
+      rounds,
+      dateStart = null,
+      perDay = 2,
+      daysOfWeek = [6, 7],
+      stadiumId: rawGenStadiumId = null,
     } = req.body || {};
 
     const g = await prisma.tournamentGroup.findUnique({
@@ -1392,7 +1452,7 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
     if (N < 2)
       return res.status(400).json({ error: 'Недостаточно команд в группе' });
 
-    // ----- круговой алгоритм -----
+    // круговой алгоритм
     const BYE = -1;
     const teams = N % 2 ? [...list, BYE] : [...list];
     const K = teams.length;
@@ -1420,7 +1480,6 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
         ? 2
         : 1;
 
-    // Сформируем плоский список пар (учитываем 2-й круг с реверсом)
     const pairList = [];
     for (let r = 1; r <= effectiveRounds; r++) {
       for (const pairs of roundsSchedule) {
@@ -1430,20 +1489,20 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
       }
     }
 
-    // ----- подготовка слот-дней -----
+    // подготовка слотов
     const base = dateStart ? new Date(dateStart) : new Date();
     const timeH = base.getHours();
     const timeM = base.getMinutes();
 
     let dows = Array.isArray(daysOfWeek)
-      ? daysOfWeek.map((n) => Number(n)).filter((n) => n >= 1 && n <= 7)
+      ? daysOfWeek.map(Number).filter((n) => n >= 1 && n <= 7)
       : [];
-    if (!dows.length) dows = [6, 7]; // Сб, Вс по умолчанию
+    if (!dows.length) dows = [6, 7];
     dows.sort((a, b) => a - b);
 
     const startOfWeekMon = (d) => {
       const js = d.getDay(); // 0=Вс ... 6=Сб
-      const delta = js === 0 ? -6 : 1 - js; // до понедельника
+      const delta = js === 0 ? -6 : 1 - js;
       const x = new Date(d);
       x.setHours(0, 0, 0, 0);
       x.setDate(x.getDate() + delta);
@@ -1456,7 +1515,7 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
 
     for (let w = 0; slots.length < need && w < 1000; w++) {
       for (const dow of dows) {
-        const addDays = dow - 1 + w * 7; // 1=Пн → +0
+        const addDays = dow - 1 + w * 7;
         const day = new Date(week0);
         day.setDate(day.getDate() + addDays);
         day.setHours(timeH, timeM, 0, 0);
@@ -1476,7 +1535,6 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
 
     const genStadiumId = toInt(rawGenStadiumId, null);
 
-    // ----- создаём матчи по слотам -----
     const created = [];
     for (let i = 0; i < pairList.length; i++) {
       const [tt1, tt2] = pairList[i];
@@ -1630,7 +1688,6 @@ router.get('/tournaments/:id(\\d+)/matches', async (req, res) => {
       prisma.tournamentMatch.count({ where }),
     ]);
 
-    // нормализация стадиона
     const rows = rowsRaw.map(normalizeMatch);
 
     setRange(res, 'tournamentMatches', start, rows.length, total);
@@ -1671,7 +1728,7 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       team2TTId,
       date,
       status = 'SCHEDULED',
-      stadiumId, // может быть и объект stadium.id
+      stadiumId,
       team1Formation,
       team2Formation,
       team1Coach,
@@ -1683,7 +1740,6 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       return res.status(400).json({ error: 'Команды в матче совпадают' });
     }
 
-    // валидация TT принадлежности турниру
     const [tt1, tt2] = await Promise.all([
       prisma.tournamentTeam.findUnique({
         where: { id: Number(team1TTId) },
@@ -1744,7 +1800,6 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       include: buildTMatchInclude('team1,team2,stadium,referees,group'),
     });
 
-    // если у группы задан судья — добавить как MAIN
     if (created.groupId) {
       const grp = await prisma.tournamentGroup.findUnique({
         where: { id: created.groupId },
@@ -1764,7 +1819,6 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       }
     }
 
-    // автопубликация
     const tset = await prisma.tournament.findUnique({
       where: { id: created.tournamentId },
       select: { autoPublishParticipants: true },
@@ -1827,12 +1881,10 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       else patch[k] = req.body[k] ?? null;
     }
 
-    // поддержка stadium как объекта
     if ('stadium' in req.body && !('stadiumId' in req.body)) {
       patch.stadiumId = toInt(req.body.stadium?.id, null);
     }
 
-    // валидации TT, group
     if (patch.team1TTId != null || patch.team2TTId != null) {
       const team1TTId = patch.team1TTId ?? old.team1TTId;
       const team2TTId = patch.team2TTId ?? old.team2TTId;
@@ -1900,19 +1952,19 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       }
     }
 
-    // если матч стал FINISHED или обновили счёт у FINISHED — пересчитать
     if (!isFinished(old.status) && isFinished(upd.status)) {
-      await recomputeTMatchScore(id); // на случай если правили события/счёт вручную
+      await recomputeTMatchScore(id);
       await serveSuspensionsAfterMatch(id);
       await recalcTotalsIfFinished(id);
+      await recomputeMatchesPlayedForMatch(id);
     }
 
-    // НОВОЕ: если матч был FINISHED и стал не FINISHED — убрать из тоталов
     if (isFinished(old.status) && !isFinished(upd.status)) {
       const t1Id = upd.team1TT?.team?.id;
       const t2Id = upd.team2TT?.team?.id;
       if (t1Id) await recalcTeamTotals(t1Id);
       if (t2Id) await recalcTeamTotals(t2Id);
+      await recomputeMatchesPlayedForMatch(id, { onlyFinished: true });
     }
 
     const io = getIO();
@@ -1935,7 +1987,6 @@ router.delete('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
 
-    // возьмём статус и команды ДО удаления
     const before = await prisma.tournamentMatch.findUnique({
       where: { id },
       select: {
@@ -1948,7 +1999,6 @@ router.delete('/tournament-matches/:matchId(\\d+)', async (req, res) => {
 
     await prisma.tournamentMatch.delete({ where: { id } });
 
-    // если удалили завершённый матч — пересчитаем тоталы команд
     if (before && isFinished(before.status)) {
       await Promise.all([
         recalcTeamTotals(before.team1TT.team.id),
@@ -2004,7 +2054,7 @@ router.post('/tournament-matches/:matchId(\\d+)/finish', async (req, res) => {
     });
 
     await serveSuspensionsAfterMatch(id);
-    await recalcTotalsIfFinished(id); // <— важный вызов
+    await recalcTotalsIfFinished(id);
 
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:status', {
@@ -2029,12 +2079,13 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
     const id = Number(req.params.matchId);
     const team1Score = toInt(req.body.team1Score, 0);
     const team2Score = toInt(req.body.team2Score, 0);
+
     const m = await prisma.tournamentMatch.update({
       where: { id },
       data: { team1Score, team2Score },
     });
 
-    await recalcTotalsIfFinished(id); // <— если матч уже FINISHED
+    await recalcTotalsIfFinished(id);
 
     const io = getIO();
     io.to(`tmatch:${id}`).emit('tmatch:score', {
@@ -2043,25 +2094,11 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
       team2Score,
     });
     io.to(`tournament:${m.tournamentId}`).emit('tmatch:update', m);
-    res.json(m);
+    return res.json(m);
   } catch (e) {
     console.error('POST /tournament-matches/:id/score', e);
-    res.status(400).json({ error: 'Не удалось обновить счёт' });
+    return res.status(400).json({ error: 'Не удалось обновить счёт' });
   }
-  try {
-    const t1 = await prisma.tournamentMatch.findUnique({
-      where: { id },
-      select: {
-        team1TT: { select: { teamId: true } },
-        team2TT: { select: { teamId: true } },
-        status: true,
-      },
-    });
-    if (t1?.team1TT?.teamId) await recalcTeamTotals(t1.team1TT.teamId);
-    if (t1?.team2TT?.teamId) await recalcTeamTotals(t1.team2TT.teamId);
-  } catch {}
-  // если матч уже завершён — ещё раз подтвердим
-  await recalcTotalsIfFinished(id);
 });
 
 router.post('/maintenance/recalc/team-totals', async (req, res) => {
@@ -2077,7 +2114,6 @@ router.post('/maintenance/recalc/team-totals', async (req, res) => {
   }
 });
 
-// пересчитать конкретной команде
 router.post('/teams/:teamId(\\d+)/recalc', async (req, res) => {
   try {
     const teamId = Number(req.params.teamId);
@@ -2253,8 +2289,8 @@ router.get(
             number:
               r.order ?? r.tournamentTeamPlayer.number ?? p.number ?? null,
             photo: photos.length ? photos[0] : null,
-            photos, // для совместимости с lineup
-            images: photos, // если фронт ждёт `images`
+            photos,
+            images: photos,
           };
         });
         return res.json(flatRows);
@@ -2279,7 +2315,6 @@ router.put(
           ? req.body.items
           : [];
 
-      // валидация: игроки должны принадлежать одной из двух команд этого матча
       const m = await prisma.tournamentMatch.findUnique({
         where: { id },
         select: { tournamentId: true, team1TTId: true, team2TTId: true },
@@ -2384,12 +2419,10 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
     });
     if (!m) return res.status(404).json({ error: 'Матч не найден' });
 
-    // валидация команды события
     if (![m.team1TTId, m.team2TTId].includes(Number(tournamentTeamId))) {
       return res.status(400).json({ error: 'Событие не этой команды матча' });
     }
 
-    // валидации заявок (если переданы)
     if (toInt(rosterItemId, null)) {
       const it = await prisma.tournamentTeamPlayer.findUnique({
         where: { id: Number(rosterItemId) },
@@ -2411,7 +2444,6 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       }
     }
 
-    // auto-judge: если не передали — возьмём судью группы/матча
     const providedRefId = toInt(issuedByRefereeId, undefined);
     const finalRefId =
       providedRefId !== undefined
@@ -2437,7 +2469,6 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       },
     });
 
-    // апдейт статистики
     if (created.rosterItemId)
       await incPlayerStatByRoster(created.rosterItemId, created.type);
     if (created.type === 'ASSIST' && created.rosterItemId)
@@ -2447,8 +2478,6 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
 
     if (isGoalType(created.type)) await recomputeTMatchScore(matchId);
     await maybeCreateSuspensionAfterEvent(created);
-
-    // если матч FINISHED — синхронизируем тоталы
     await recalcTotalsIfFinished(matchId);
 
     const m2 = await prisma.tournamentMatch.findUnique({
@@ -2482,9 +2511,6 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
   }
 });
 
-// рядом с participants/events
-// рядом с participants/events
-// рядом с participants/events
 router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
@@ -2500,16 +2526,13 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
       where: { matchId: id },
       include: {
         tournamentTeamPlayer: {
-          include: {
-            player: true, // <— тут уже есть images, number, position (из профиля)
-            tournamentTeam: true,
-          },
+          include: { player: true, tournamentTeam: true },
         },
       },
       orderBy: [{ role: 'asc' }, { order: 'asc' }, { id: 'asc' }],
     });
 
-    // 2) возьмём капитанов TT на случай фолбэка (и пригодится для метки капитана)
+    // 2) капитаны TT (для метки)
     const ttCaps = await prisma.tournamentTeam.findMany({
       where: { id: { in: [m.team1TTId, m.team2TTId] } },
       select: { id: true, captainRosterItemId: true },
@@ -2538,14 +2561,14 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
           number: r.number,
           position: r.position ?? null,
           playerId: r.playerId,
-          player: r.player, // есть .images[]
+          player: r.player,
           tournamentTeamId: r.tournamentTeamId,
           tournamentTeam: r.tournamentTeam,
         },
       }));
     }
 
-    // 4) удобный маппер под фронт: добавляем photo/photos, корректные position и number
+    // 4) маппинг под фронт
     const toList = (ttId) =>
       rows
         .filter(
@@ -2555,16 +2578,10 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
         .map((r) => {
           const p = r.tournamentTeamPlayer.player || {};
           const num =
-            r.order ?? // из участника (мы кладём туда номер)
-            r.tournamentTeamPlayer.number ?? // номер из заявки TT
-            p.number ?? // запасной номер из профиля игрока
-            null;
+            r.order ?? r.tournamentTeamPlayer.number ?? p.number ?? null;
 
           const pos =
-            r.position ?? // позиция из участника
-            r.tournamentTeamPlayer.position ?? // позиция из заявки TT
-            p.position ?? // позиция из профиля игрока
-            null;
+            r.position ?? r.tournamentTeamPlayer.position ?? p.position ?? null;
 
           return {
             rosterItemId: r.tournamentTeamPlayerId,
@@ -2576,7 +2593,6 @@ router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
             isCaptain:
               !!r.isCaptain || r.tournamentTeamPlayerId === capMap.get(ttId),
             order: num ?? 0,
-            // НОВОЕ:
             photo:
               Array.isArray(p.images) && p.images.length ? p.images[0] : null,
             photos: Array.isArray(p.images) ? p.images : [],
@@ -2600,7 +2616,6 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
     const old = await prisma.tournamentMatchEvent.findUnique({ where: { id } });
     if (!old) return res.status(404).json({ error: 'Событие не найдено' });
 
-    // - снимаем прошлую статистику
     if (old.rosterItemId)
       await decPlayerStatByRoster(old.rosterItemId, old.type);
     if (old.type === 'ASSIST' && old.rosterItemId)
@@ -2619,7 +2634,6 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       issuedByRefereeId,
     } = req.body;
 
-    // валидации
     const m = await prisma.tournamentMatch.findUnique({
       where: { id: old.matchId },
       select: { team1TTId: true, team2TTId: true },
@@ -2671,7 +2685,6 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       },
     });
 
-    // + накатываем новую статистику
     if (updated.rosterItemId)
       await incPlayerStatByRoster(updated.rosterItemId, updated.type);
     if (updated.type === 'ASSIST' && updated.rosterItemId)
@@ -2682,7 +2695,6 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
     if (isGoalType(updated.type) || isGoalType(old.type))
       await recomputeTMatchScore(updated.matchId);
 
-    // если матч FINISHED — синхронизируем тоталы
     await recalcTotalsIfFinished(updated.matchId);
 
     const m2 = await prisma.tournamentMatch.findUnique({
@@ -2732,8 +2744,6 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
 
     if (isGoalType(old.type)) await recomputeTMatchScore(old.matchId);
-
-    // если матч FINISHED — синхронизируем тоталы
     await recalcTotalsIfFinished(old.matchId);
 
     const m = await prisma.tournamentMatch.findUnique({
@@ -2931,7 +2941,7 @@ router.delete('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
   }
 });
 
-// ↓ рядом с другими GROUPS-роутами
+// матчи группы
 router.get('/tournament-groups/:groupId(\\d+)/matches', async (req, res) => {
   try {
     const groupId = Number(req.params.groupId);
@@ -2958,11 +2968,10 @@ router.get('/tournament-groups/:groupId(\\d+)/matches', async (req, res) => {
   }
 });
 
-// ===== standings (group table)
+// standings (group table)
 router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
   try {
     const groupId = Number(req.params.groupId);
-    // по умолчанию считаем только завершённые
     const statuses = (req.query.statuses || 'FINISHED')
       .split(',')
       .map((s) => s.trim().toUpperCase())
@@ -2977,7 +2986,6 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
     });
     if (!g) return res.status(404).json({ error: 'Группа не найдена' });
 
-    // подготовим строки таблицы под все команды группы
     const rowsMap = new Map();
     for (const gt of g.teams) {
       const tt = gt.tournamentTeam;
@@ -3000,7 +3008,6 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
       });
     }
 
-    // берём матчи группы (по умолчанию только FINISHED)
     const matches = await prisma.tournamentMatch.findMany({
       where: { groupId, status: { in: statuses } },
       select: {
@@ -3046,18 +3053,13 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
       }
     }
 
-    // дифференциал
     rowsMap.forEach((r) => {
       r.goalDiff = r.goalsFor - r.goalsAgainst;
     });
 
-    // карточки по матчам этой группы
     const cards = await prisma.tournamentMatchEvent.groupBy({
       by: ['tournamentTeamId', 'type'],
-      where: {
-        match: { groupId },
-        type: { in: ['YELLOW_CARD', 'RED_CARD'] },
-      },
+      where: { match: { groupId }, type: { in: ['YELLOW_CARD', 'RED_CARD'] } },
       _count: { _all: true },
     });
     for (const c of cards) {
@@ -3067,7 +3069,6 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
       if (c.type === 'RED_CARD') row.red += c._count._all;
     }
 
-    // сортировка
     const table = Array.from(rowsMap.values()).sort(
       (a, b) =>
         b.points - a.points ||
@@ -3087,6 +3088,23 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
   } catch (e) {
     console.error('GET /tournament-groups/:groupId/standings', e);
     res.status(500).json({ error: 'Ошибка расчёта таблицы группы' });
+  }
+});
+
+// Глобальный пересчёт matchesPlayed из заявок (по всем/по одному игроку)
+router.post('/player-stats/recompute', async (req, res) => {
+  try {
+    const pid = toInt(req.body?.playerId, null);
+    const onlyFinished = toBool(req.body?.onlyFinished, true);
+    await prisma.$transaction(async (tx) => {
+      await recomputeMatchesPlayedTX(tx, pid ? [pid] : null, onlyFinished);
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('POST /player-stats/recompute', e);
+    res
+      .status(500)
+      .json({ error: 'Не удалось пересчитать статистику игроков' });
   }
 });
 

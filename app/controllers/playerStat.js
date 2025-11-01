@@ -5,7 +5,7 @@ import { PrismaClient } from '@prisma/client';
 const router = Router();
 const prisma = new PrismaClient();
 
-/* --------------- utils --------------- */
+/* ----------------- utils ----------------- */
 const safeJSON = (v, fb) => {
   try {
     return v ? JSON.parse(String(v)) : fb;
@@ -14,6 +14,8 @@ const safeJSON = (v, fb) => {
   }
 };
 const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
+const toInt0 = (v) => (v === '' || v == null ? 0 : Number(v) || 0);
+
 const setRange = (res, name, start, count, total) => {
   res.setHeader(
     'Content-Range',
@@ -22,15 +24,30 @@ const setRange = (res, name, start, count, total) => {
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
 
+// Принимаем любые синонимы для «сыгранных матчей»
+const pickMatchesPlayed = (b) =>
+  toInt0(
+    b?.matchesPlayed ??
+      b?.matches_played ??
+      b?.matches ??
+      b?.games_played ??
+      b?.games
+  );
+
+const normalizePayload = (body = {}) => ({
+  playerId: Number(body.playerId),
+  goals: toInt0(body.goals),
+  assists: toInt0(body.assists),
+  yellow_cards: toInt0(body.yellow_cards),
+  red_cards: toInt0(body.red_cards),
+  matchesPlayed: pickMatchesPlayed(body),
+});
+
 /* =========================================
    LIST  GET /player-stats
-   filter supports:
-     id: [1,2] | playerId | teamId | leagueId
-     q (player.name contains, case-insens)
-     position, number
-     minGoals/minAssists/minMatches
-   sort supports:
-     ["id"|"goals"|"assists"|"matchesPlayed"|"player.name", "ASC"|"DESC"]
+   filter: id[], playerId, teamId, leagueId, q, position, number,
+           minGoals, minAssists, minMatches
+   sort: ["id"|"goals"|"assists"|"matchesPlayed"|"player.name","ASC"|"DESC"]
    ========================================= */
 router.get('/', async (req, res) => {
   try {
@@ -60,7 +77,6 @@ router.get('/', async (req, res) => {
       AND.push({ player: { teamId: Number(filter.teamId) } });
     }
     if (filter.leagueId != null && Number.isFinite(Number(filter.leagueId))) {
-      // есть в матчах этой лиги?
       AND.push({
         OR: [
           {
@@ -158,37 +174,23 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* ================ CREATE (upsert по playerId) ================ */
+/* ================ CREATE/UPSERT по playerId ================ */
 router.post('/', async (req, res) => {
   try {
-    const {
-      playerId,
-      goals = 0,
-      assists = 0,
-      yellow_cards = 0,
-      red_cards = 0,
-      matchesPlayed = 0,
-    } = req.body;
-    if (!playerId)
+    const data = normalizePayload(req.body);
+    if (!data.playerId) {
       return res.status(400).json({ error: 'playerId обязателен' });
+    }
 
-    // из-за @unique на playerId — делаем upsert
     const result = await prisma.playerStat.upsert({
-      where: { playerId: Number(playerId) },
-      create: {
-        playerId: Number(playerId),
-        goals,
-        assists,
-        yellow_cards,
-        red_cards,
-        matchesPlayed,
-      },
+      where: { playerId: data.playerId },
+      create: data,
       update: {
-        goals,
-        assists,
-        yellow_cards,
-        red_cards,
-        matchesPlayed,
+        goals: data.goals,
+        assists: data.assists,
+        yellow_cards: data.yellow_cards,
+        red_cards: data.red_cards,
+        matchesPlayed: data.matchesPlayed,
       },
     });
     res.status(201).json(result);
@@ -198,14 +200,14 @@ router.post('/', async (req, res) => {
   }
 });
 
-/* ================ PATCH (частичное) ================ */
+/* ================ PATCH (частично) ================ */
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const patch = {};
     ['goals', 'assists', 'yellow_cards', 'red_cards', 'matchesPlayed'].forEach(
       (k) => {
-        if (req.body[k] !== undefined) patch[k] = Number(req.body[k]) || 0;
+        if (req.body[k] !== undefined) patch[k] = toInt0(req.body[k]);
       }
     );
     const updated = await prisma.playerStat.update({
@@ -219,27 +221,14 @@ router.patch('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* ================ PUT (полная замена) ================ */
+/* ================ PUT (полностью) ================ */
 router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const {
-      goals = 0,
-      assists = 0,
-      yellow_cards = 0,
-      red_cards = 0,
-      matchesPlayed = 0,
-    } = req.body;
-    const updated = await prisma.playerStat.update({
-      where: { id },
-      data: {
-        goals,
-        assists,
-        yellow_cards,
-        red_cards,
-        matchesPlayed,
-      },
-    });
+    const data = normalizePayload(req.body);
+    // playerId при апдейте не меняем
+    delete data.playerId;
+    const updated = await prisma.playerStat.update({ where: { id }, data });
     res.json(updated);
   } catch (err) {
     console.error('Ошибка PUT /player-stats/:id:', err);
@@ -262,15 +251,18 @@ router.delete('/:id(\\d+)', async (req, res) => {
 /* =========================================================
    Пересчёт статистики из событий и участий
    источники:
-     - MatchEvent: type IN (GOAL, ASSIST, YELLOW_CARD, RED_CARD)
-     - PlayerMatch: distinct по matchId => matchesPlayed
-   фильтры (body/query): playerId?, teamId?, leagueId?
+     - MatchEvent: type ∈ {GOAL, ASSIST, YELLOW_CARD, RED_CARD, PENALTY_SCORED}
+     - PlayerMatch / TournamentPlayerMatch: distinct matchId => matchesPlayed
+   фильтры: playerId?, teamId?, leagueId?, tournamentId?, onlyFinished?(true|false)
    ========================================================= */
-async function computeStatsForPlayer(playerId, { leagueId } = {}) {
-  // goals/assists/cards
+async function computeStatsForPlayer(
+  playerId,
+  { leagueId, tournamentId, onlyFinished = false } = {}
+) {
+  // События по ЛИГОВЫМ матчам (если leagueId задан, фильтруем по нему)
   const whereEvent = {
     OR: [{ playerId }, { assistPlayerId: playerId }],
-    ...(leagueId ? { match: { leagueId } } : {}),
+    ...(leagueId != null ? { match: { leagueId } } : {}),
   };
 
   const events = await prisma.matchEvent.groupBy({
@@ -280,19 +272,43 @@ async function computeStatsForPlayer(playerId, { leagueId } = {}) {
   });
 
   const countBy = (t) => events.find((e) => e.type === t)?._count._all || 0;
-  const goals = countBy('GOAL') + countBy('PENALTY_SCORED'); // по желанию учитываем пенальти как гол
+  const goals = countBy('GOAL') + countBy('PENALTY_SCORED');
   const assists = countBy('ASSIST');
   const yellow = countBy('YELLOW_CARD');
   const red = countBy('RED_CARD');
 
-  // matchesPlayed — участие в матче хотя бы 1 раз
-  const pmWhere = { playerId, ...(leagueId ? { match: { leagueId } } : {}) };
-  const distinctMatches = await prisma.playerMatch.findMany({
-    where: pmWhere,
-    distinct: ['matchId'],
+  const statusFilter = onlyFinished ? { status: 'FINISHED' } : {};
+
+  // 1) ЛИГИ: участие из заявки (PlayerMatch)
+  const leaguePM = await prisma.playerMatch.findMany({
+    where: {
+      playerId,
+      match: {
+        ...(leagueId != null ? { leagueId } : {}),
+        ...statusFilter,
+      },
+    },
     select: { matchId: true },
+    distinct: ['matchId'],
   });
-  const matchesPlayed = distinctMatches.length;
+
+  // 2) ТУРНИРЫ: участие из заявки (TournamentPlayerMatch -> tournamentTeamPlayer.playerId)
+  const tourPM = await prisma.tournamentPlayerMatch.findMany({
+    where: {
+      tournamentTeamPlayer: { playerId },
+      match: {
+        ...(tournamentId != null ? { tournamentId } : {}),
+        ...statusFilter,
+      },
+    },
+    select: { matchId: true },
+    distinct: ['matchId'],
+  });
+
+  const matchesPlayed = new Set([
+    ...leaguePM.map((r) => `L-${r.matchId}`),
+    ...tourPM.map((r) => `T-${r.matchId}`),
+  ]).size;
 
   return {
     goals,
@@ -308,6 +324,9 @@ router.post('/recompute', async (req, res) => {
     const playerId = toInt(req.body.playerId);
     const teamId = toInt(req.body.teamId);
     const leagueId = toInt(req.body.leagueId);
+    const tournamentId = toInt(req.body.tournamentId);
+    const onlyFinished =
+      String(req.body.onlyFinished || 'false').toLowerCase() === 'true';
     const dry = String(req.body.dry || 'false').toLowerCase() === 'true';
 
     let playerIds = [];
@@ -321,15 +340,24 @@ router.post('/recompute', async (req, res) => {
       });
       playerIds = rows.map((r) => r.id);
     } else if (leagueId != null) {
-      // Все игроки, которые появлялись в матчах лиги
+      // игроки, попадавшие в заявки лиговых матчей
       const rows = await prisma.playerMatch.findMany({
         where: { match: { leagueId } },
         distinct: ['playerId'],
         select: { playerId: true },
       });
       playerIds = rows.map((r) => r.playerId);
+    } else if (tournamentId != null) {
+      // игроки, попадавшие в заявки турнирных матчей
+      const rows = await prisma.tournamentPlayerMatch.findMany({
+        where: { match: { tournamentId } },
+        select: { tournamentTeamPlayer: { select: { playerId: true } } },
+      });
+      playerIds = [
+        ...new Set(rows.map((r) => r.tournamentTeamPlayer.playerId)),
+      ];
     } else {
-      // все игроки у кого уже есть stats
+      // все, у кого уже есть агрегированная статистика
       const rows = await prisma.playerStat.findMany({
         select: { playerId: true },
       });
@@ -338,12 +366,17 @@ router.post('/recompute', async (req, res) => {
 
     const updates = [];
     for (const pid of playerIds) {
-      const computed = await computeStatsForPlayer(pid, { leagueId });
+      const computed = await computeStatsForPlayer(pid, {
+        leagueId,
+        tournamentId,
+        onlyFinished,
+      });
       updates.push({ playerId: pid, ...computed });
     }
 
-    if (dry)
+    if (dry) {
       return res.json({ count: updates.length, preview: updates.slice(0, 10) });
+    }
 
     await prisma.$transaction(
       updates.map((u) =>
@@ -369,18 +402,24 @@ router.post('/recompute', async (req, res) => {
 });
 
 /* =========================================================
-   Лидерборд: GET /player-stats/leaderboard?leagueId=&metric=goals|assists|cards&limit=20
-   cards = (yellow_cards + 2*red_cards) сортируем по убыванию
+   Лидерборд: GET /player-stats/leaderboard
+   query:
+     leagueId?       — пересчитать «налету» по лиге
+     tournamentId?   — пересчитать «налету» по турниру
+     metric=goals|assists|cards
+     limit=1..100 (default 20)
+   cards = (yellow_cards + 2*red_cards)
    ========================================================= */
 router.get('/leaderboard', async (req, res) => {
   try {
     const leagueId = toInt(req.query.leagueId);
+    const tournamentId = toInt(req.query.tournamentId);
     const metric = String(req.query.metric || 'goals');
     const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 20)));
 
-    // если задана лига — сперва делаем пересчёт (без записи) и сортируем в памяти
-    if (leagueId != null) {
-      const rows = await prisma.player.findMany({
+    // Если задана лига/турнир — считаем налету по событиям/участиям
+    if (leagueId != null || tournamentId != null) {
+      const players = await prisma.player.findMany({
         select: {
           id: true,
           name: true,
@@ -389,8 +428,8 @@ router.get('/leaderboard', async (req, res) => {
         },
       });
       const computed = [];
-      for (const p of rows) {
-        const s = await computeStatsForPlayer(p.id, { leagueId });
+      for (const p of players) {
+        const s = await computeStatsForPlayer(p.id, { leagueId, tournamentId });
         computed.push({ playerId: p.id, player: p, ...s });
       }
       const score = (r) =>
@@ -403,12 +442,12 @@ router.get('/leaderboard', async (req, res) => {
       return res.json(computed.slice(0, limit));
     }
 
-    // иначе — по aggregated таблице
+    // Иначе — по агрегированной таблице
     const orderBy =
       metric === 'assists'
         ? { assists: 'desc' }
         : metric === 'cards'
-          ? { yellow_cards: 'desc' } // грубо; можно добавить ORDER BY (yellow+2*red) в памяти
+          ? { yellow_cards: 'desc' } // затем вручную учтём 2*red
           : { goals: 'desc' };
 
     const rows = await prisma.playerStat.findMany({
