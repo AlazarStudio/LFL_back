@@ -969,65 +969,75 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     });
     if (!tt) return res.status(404).json({ error: 'TournamentTeam не найден' });
 
+    // ---- bulk players
+    const ids = items.map((it) => Number(it.playerId)).filter(Number.isFinite);
+    const players = ids.length
+      ? await prisma.player.findMany({
+          where: { id: { in: ids } },
+          select: {
+            id: true,
+            teamId: true,
+            position: true,
+            number: true,
+          },
+        })
+      : [];
+    const pMap = new Map(players.map((p) => [p.id, p]));
+
+    // валидация состава и капитана
     for (const it of items) {
       const pid = Number(it.playerId);
-      const p = await prisma.player.findUnique({
-        where: { pid },
-        select: { teamId: true, position: true, number: true },
-      });
-      if (!p || p.teamId !== tt.teamId)
+      const p = pMap.get(pid);
+      if (!p || p.teamId !== tt.teamId) {
         return res.status(400).json({ error: 'Игрок не из этой команды' });
+      }
     }
     if (captainPlayerId) {
-      const p = await prisma.player.findUnique({
+      const cap = await prisma.player.findUnique({
         where: { id: captainPlayerId },
         select: { teamId: true },
       });
-      if (!p || p.teamId !== tt.teamId)
+      if (!cap || cap.teamId !== tt.teamId) {
         return res.status(400).json({ error: 'Капитан не из этой команды' });
+      }
     }
 
-    const maxStarters =
-      STARTERS_BY_FORMAT[tt.tournament.format || 'F11x11'] ?? 11;
-    const startersCount = items.filter(
-      (it) => (it.role || 'STARTER') === 'STARTER'
-    ).length;
-    if (startersCount > maxStarters) {
-      return res.status(400).json({
-        error: `Стартеров больше лимита (${maxStarters}) для формата ${tt.tournament.format}`,
-      });
-    }
-
+    // ---- сохраняем (без лимита стартеров)
     const result = await prisma.$transaction(async (tx) => {
       await tx.tournamentTeamPlayer.deleteMany({
         where: { tournamentTeamId: id },
       });
+
       let created = [];
       if (items.length) {
         created = await Promise.all(
-          items.map((it) =>
-            tx.tournamentTeamPlayer.create({
+          items.map((it) => {
+            const pid = Number(it.playerId);
+            const p = pMap.get(pid);
+            return tx.tournamentTeamPlayer.create({
               data: {
                 tournamentTeamId: id,
-                playerId: Number(it.playerId),
-                number: toInt(it.number, null),
-                position: it.position ?? null,
-                role: it.role ?? null,
+                playerId: pid,
+                number: toInt(it.number, p?.number ?? null),
+                position: it.position ?? p?.position ?? null,
+                role: it.role ?? 'STARTER',
                 notes: it.notes ?? null,
               },
-            })
-          )
+            });
+          })
         );
       }
+
+      // капитан по playerId (если передан)
       if (captainPlayerId) {
-        const cap =
+        const capRow =
           created.find((r) => r.playerId === captainPlayerId) ||
           (await tx.tournamentTeamPlayer.findFirst({
             where: { tournamentTeamId: id, playerId: captainPlayerId },
           }));
         await tx.tournamentTeam.update({
           where: { id },
-          data: { captainRosterItemId: cap ? cap.id : null },
+          data: { captainRosterItemId: capRow ? capRow.id : null },
         });
       } else {
         await tx.tournamentTeam.update({
@@ -1048,6 +1058,7 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     getIO()
       .to(`tournament:${tt.tournamentId}`)
       .emit('troster:updated', { tournamentTeamId: id });
+
     res.json(result);
   } catch (e) {
     console.error('PUT /tournament-teams/:ttId/roster', e);
