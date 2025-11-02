@@ -1480,9 +1480,13 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
 
     const pairList = [];
     for (let r = 1; r <= effectiveRounds; r++) {
-      for (const pairs of roundsSchedule) {
-        for (const [a, b] of pairs) {
-          pairList.push(r === 1 ? [a, b] : [b, a]);
+      for (let roundIdx = 0; roundIdx < roundsSchedule.length; roundIdx++) {
+        const pairs = roundsSchedule[roundIdx];
+        const tour = (r - 1) * (K - 1) + (roundIdx + 1); // № тура
+        for (const [a0, b0] of pairs) {
+          if (a0 === BYE || b0 === BYE) continue;
+          const [a, b] = r === 1 ? [a0, b0] : [b0, a0]; // во 2-м круге меняем хозяев
+          pairList.push({ a, b, tour });
         }
       }
     }
@@ -1535,21 +1539,20 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
 
     const created = [];
     for (let i = 0; i < pairList.length; i++) {
-      const [tt1, tt2] = pairList[i];
+      const { a, b, tour } = pairList[i]; // ✅
       const when = slots[i];
 
-      const m = await prisma.tournamentMatch.create({
-        data: {
-          date: when,
-          status: 'SCHEDULED',
-          tournament: { connect: { id: g.tournamentId } },
-          group: { connect: { id: g.id } },
-          team1TT: { connect: { id: tt1 } },
-          team2TT: { connect: { id: tt2 } },
-          ...(genStadiumId
-            ? { stadiumRel: { connect: { id: genStadiumId } } }
-            : {}),
-        },
+    const m = await prisma.tournamentMatch.create({
+    data: {
+      date: when,
+      status: 'SCHEDULED',
+      tour,
+      tournament: { connect: { id: g.tournamentId } },
+      group: { connect: { id: g.id } },
+      team1TT: { connect: { id: a } },
+      team2TT: { connect: { id: b } },
+      ...(genStadiumId ? { stadiumRel: { connect: { id: genStadiumId } } } : {}),
+    },
       });
       created.push(m);
 
@@ -1732,6 +1735,7 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       team1Coach,
       team2Coach,
       referees = [],
+      tour,
     } = req.body;
 
     if (Number(team1TTId) === Number(team2TTId)) {
@@ -1779,7 +1783,7 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
       team2Formation: team2Formation ?? null,
       team1Coach: team1Coach ?? null,
       team2Coach: team2Coach ?? null,
-
+      tour: toInt(tour, null),
       referees: {
         create: (referees || []).map((r) => ({
           refereeId: Number(r.refereeId),
@@ -1870,10 +1874,11 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       'team2Coach',
       'team1Score',
       'team2Score',
+      'tour',
     ];
     for (const k of keys) {
       if (!(k in req.body)) continue;
-      if (k.endsWith('Id') || ['team1Score', 'team2Score'].includes(k))
+      if (k.endsWith('Id') || ['team1Score', 'team2Score', 'tour'].includes(k))
         patch[k] = toInt(req.body[k], null);
       else if (k === 'date') patch[k] = toDate(req.body[k], undefined);
       else patch[k] = req.body[k] ?? null;
@@ -1929,11 +1934,10 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
           select: { defaultRefereeId: true },
         });
         if (g?.defaultRefereeId) {
-          const hasMain = await prisma.tournamentMatchReferee.findFirst({
+          const hasMain = await prisma.tournamentMatchReferee.count({
             where: { matchId: id, role: 'MAIN' },
-            select: { id: true },
           });
-          if (!hasMain) {
+          if (hasMain === 0) {
             await prisma.tournamentMatchReferee.create({
               data: {
                 matchId: id,
@@ -1972,7 +1976,7 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
     res.json(normalizeMatch(upd));
   } catch (e) {
     console.error('PATCH /tournament-matches/:matchId', e);
-    res.status(400).json({ error: 'Ошибка обновления матча' });
+    res.status(400).json({ error: e?.message || 'Ошибка обновления матча' });
   }
 });
 router.put('/tournament-matches/:matchId(\\d+)', (req, res) => {
