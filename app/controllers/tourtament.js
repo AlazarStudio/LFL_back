@@ -972,8 +972,8 @@ router.put('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     for (const it of items) {
       const pid = Number(it.playerId);
       const p = await prisma.player.findUnique({
-        where: { id: pid },
-        select: { teamId: true },
+        where: { pid },
+        select: { teamId: true, position: true, number: true },
       });
       if (!p || p.teamId !== tt.teamId)
         return res.status(400).json({ error: 'Игрок не из этой команды' });
@@ -1075,32 +1075,19 @@ router.post('/tournament-teams/:ttId(\\d+)/roster', async (req, res) => {
     if (!p || p.teamId !== tt.teamId)
       return res.status(400).json({ error: 'Игрок не из этой команды' });
 
-    if ((req.body.role ?? 'STARTER') === 'STARTER') {
-      const maxStarters =
-        STARTERS_BY_FORMAT[tt.tournament.format || 'F11x11'] ?? 11;
-      const startersNow = await prisma.tournamentTeamPlayer.count({
-        where: { tournamentTeamId: id, role: 'STARTER' },
-      });
-      if (startersNow + 1 > maxStarters) {
-        return res.status(400).json({
-          error: `Стартеров больше лимита (${maxStarters}) для формата ${tt.tournament.format}`,
-        });
-      }
-    }
-
     const item = await prisma.tournamentTeamPlayer.upsert({
       where: { tournamentTeamId_playerId: { tournamentTeamId: id, playerId } },
       update: {
         number: toInt(req.body.number, undefined),
-        position: req.body.position ?? undefined,
+        position: req.body.position ?? p.position ?? undefined,
         role: req.body.role ?? undefined,
         notes: req.body.notes ?? undefined,
       },
       create: {
         tournamentTeamId: id,
         playerId,
-        number: toInt(req.body.number, null),
-        position: req.body.position ?? null,
+        number: toInt(req.body.number, p.number ?? null),
+        position: req.body.position ?? p.position ?? null,
         role: req.body.role ?? null,
         notes: req.body.notes ?? null,
       },
