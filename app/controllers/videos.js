@@ -29,25 +29,54 @@ const toStrArr = (val) => {
     .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
     .filter(Boolean);
 };
-const buildInclude = (p) => {
+const buildIncludeFlags = (p) => {
   const parts = String(p || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   return {
-    league: !!parts.includes('league'),
-    match: !!parts.includes('match'),
-    tournament: !!parts.includes('tournament'),
+    league: parts.includes('league'),
+    match: parts.includes('match'),
+    tmatch: parts.includes('tmatch') || parts.includes('tournamentmatch'),
+    tournament: parts.includes('tournament'),
   };
 };
+const makeInclude = (flags) => {
+  const inc = {};
+  if (flags?.league) inc.league = true;
+  if (flags?.match) inc.match = true;
+  if (flags?.tmatch) inc.tMatch = true; // relation name in Prisma
+  if (flags?.tournament) inc.tournament = true;
+  return inc;
+};
+
+/* small helpers to auto-fill parents */
+async function deriveLeagueIdFromMatchId(matchId) {
+  const id = toInt(matchId, null);
+  if (!id) return undefined;
+  const m = await prisma.match.findUnique({
+    where: { id },
+    select: { leagueId: true },
+  });
+  return m?.leagueId ?? undefined;
+}
+async function deriveTournamentIdFromTMatchId(tMatchId) {
+  const id = toInt(tMatchId, null);
+  if (!id) return undefined;
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id },
+    select: { tournamentId: true },
+  });
+  return m?.tournamentId ?? undefined;
+}
 
 /* =========================================================
    LIST: GET /videos
    filter: id[], q(title), title, date_gte/lte,
-           leagueId, matchId, tournamentId,
+           leagueId, matchId, tournamentId, tMatchId,
            hasUrl, hasVideos, hasAny
    sort: ["id"|"date"|"createdAt"|"title","ASC"|"DESC"]
-   include=league,match,tournament
+   include=league,match,tmatch,tournament
    ========================================================= */
 router.get('/', async (req, res) => {
   try {
@@ -60,7 +89,7 @@ router.get('/', async (req, res) => {
     const sortField = String(sort[0] || 'date');
     const sortOrder =
       String(sort[1] || 'DESC').toLowerCase() === 'desc' ? 'desc' : 'asc';
-    const include = buildInclude(req.query.include);
+    const incFlags = buildIncludeFlags(req.query.include);
 
     const AND = [];
     if (Array.isArray(filter.id) && filter.id.length) {
@@ -86,6 +115,9 @@ router.get('/', async (req, res) => {
     }
     if (filter.matchId != null && Number.isFinite(Number(filter.matchId))) {
       AND.push({ matchId: Number(filter.matchId) });
+    }
+    if (filter.tMatchId != null && Number.isFinite(Number(filter.tMatchId))) {
+      AND.push({ tMatchId: Number(filter.tMatchId) });
     }
     if (
       filter.tournamentId != null &&
@@ -113,7 +145,7 @@ router.get('/', async (req, res) => {
         take,
         where,
         orderBy: { [sortField]: sortOrder },
-        include,
+        include: makeInclude(incFlags),
       }),
       prisma.video.count({ where }),
     ]);
@@ -130,11 +162,11 @@ router.get('/', async (req, res) => {
 router.get('/latest', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 12)));
-    const include = buildInclude(req.query.include);
+    const incFlags = buildIncludeFlags(req.query.include);
     const rows = await prisma.video.findMany({
       take: limit,
       orderBy: { date: 'desc' },
-      include,
+      include: makeInclude(incFlags),
     });
     res.json(rows);
   } catch (e) {
@@ -168,6 +200,19 @@ router.get('/by-match/:matchId(\\d+)', async (req, res) => {
     res.status(500).json({ error: 'Ошибка загрузки видео матча' });
   }
 });
+router.get('/by-tmatch/:tMatchId(\\d+)', async (req, res) => {
+  try {
+    const tMatchId = Number(req.params.tMatchId);
+    const rows = await prisma.video.findMany({
+      where: { tMatchId },
+      orderBy: { date: 'desc' },
+    });
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos/by-tmatch', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео турнирного матча' });
+  }
+});
 router.get('/by-tournament/:tournamentId(\\d+)', async (req, res) => {
   try {
     const tournamentId = Number(req.params.tournamentId);
@@ -186,8 +231,11 @@ router.get('/by-tournament/:tournamentId(\\d+)', async (req, res) => {
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const include = buildInclude(req.query.include);
-    const item = await prisma.video.findUnique({ where: { id }, include });
+    const incFlags = buildIncludeFlags(req.query.include);
+    const item = await prisma.video.findUnique({
+      where: { id },
+      include: makeInclude(incFlags),
+    });
     if (!item) return res.status(404).json({ error: 'Не найдено' });
     res.json(item);
   } catch (e) {
@@ -208,17 +256,34 @@ router.post('/', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
-    const data = {
-      title: title ?? null,
-      date: toDate(date, new Date()),
-      url: url ? String(url) : null,
-      videos: toStrArr([...videos, ...videosRaw]),
-      leagueId: toInt(leagueId, null),
-      matchId: toInt(matchId, null),
-      tournamentId: toInt(tournamentId, null),
-    };
-    const created = await prisma.video.create({ data });
+
+    const _matchId = toInt(matchId, null);
+    const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+    let _leagueId = toInt(leagueId, null);
+    let _tournamentId = toInt(tournamentId, null);
+
+    if (_matchId && _leagueId == null) {
+      _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+    }
+    if (_tMatchId && _tournamentId == null) {
+      _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+    }
+
+    const created = await prisma.video.create({
+      data: {
+        title: title ?? null,
+        date: toDate(date, new Date()),
+        url: url ? String(url) : null,
+        videos: toStrArr([...videos, ...videosRaw]),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
+      },
+    });
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /videos', e);
@@ -239,7 +304,10 @@ router.patch('/:id(\\d+)', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
+
     const patch = {};
     if (title !== undefined) patch.title = title;
     if (date !== undefined) patch.date = toDate(date);
@@ -247,10 +315,38 @@ router.patch('/:id(\\d+)', async (req, res) => {
     if (videos !== undefined || videosRaw !== undefined) {
       patch.videos = toStrArr([...(videos || []), ...(videosRaw || [])]);
     }
-    if (leagueId !== undefined) patch.leagueId = toInt(leagueId, null);
-    if (matchId !== undefined) patch.matchId = toInt(matchId, null);
-    if (tournamentId !== undefined)
-      patch.tournamentId = toInt(tournamentId, null);
+
+    let _matchId;
+    let _tMatchId;
+    let _leagueId;
+    let _tournamentId;
+
+    if (leagueId !== undefined) {
+      _leagueId = toInt(leagueId, null);
+      patch.leagueId = _leagueId;
+    }
+    if (matchId !== undefined) {
+      _matchId = toInt(matchId, null);
+      patch.matchId = _matchId;
+    }
+    if (tournamentId !== undefined) {
+      _tournamentId = toInt(tournamentId, null);
+      patch.tournamentId = _tournamentId;
+    }
+    if (tMatchId !== undefined || tournamentMatchId !== undefined) {
+      _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+      patch.tMatchId = _tMatchId;
+    }
+
+    // auto-fill parents if possible and not explicitly provided
+    if (_matchId != null && leagueId === undefined) {
+      const derived = await deriveLeagueIdFromMatchId(_matchId);
+      if (derived != null) patch.leagueId = derived;
+    }
+    if (_tMatchId != null && tournamentId === undefined) {
+      const derived = await deriveTournamentIdFromTMatchId(_tMatchId);
+      if (derived != null) patch.tournamentId = derived;
+    }
 
     const updated = await prisma.video.update({ where: { id }, data: patch });
     res.json(updated);
@@ -260,7 +356,7 @@ router.patch('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* PUT (полная замена) */
+/* PUT */
 router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -273,7 +369,22 @@ router.put('/:id(\\d+)', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
+
+    const _matchId = toInt(matchId, null);
+    const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+    let _leagueId = toInt(leagueId, null);
+    let _tournamentId = toInt(tournamentId, null);
+
+    if (_matchId && _leagueId == null) {
+      _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+    }
+    if (_tMatchId && _tournamentId == null) {
+      _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+    }
+
     const updated = await prisma.video.update({
       where: { id },
       data: {
@@ -281,9 +392,10 @@ router.put('/:id(\\d+)', async (req, res) => {
         date: toDate(date),
         url: url ? String(url) : null,
         videos: toStrArr([...videos, ...videosRaw]),
-        leagueId: toInt(leagueId, null),
-        matchId: toInt(matchId, null),
-        tournamentId: toInt(tournamentId, null),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
       },
     });
     res.json(updated);
@@ -297,16 +409,31 @@ router.put('/:id(\\d+)', async (req, res) => {
 router.post('/:id(\\d+)/attach', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { leagueId, matchId, tournamentId } = req.body || {};
-    const updated = await prisma.video.update({
-      where: { id },
-      data: {
-        leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
-        matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
-        tournamentId:
-          tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
-      },
-    });
+    const { leagueId, matchId, tournamentId, tMatchId, tournamentMatchId } =
+      req.body || {};
+
+    const data = {
+      leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
+      matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
+      tMatchId:
+        tMatchId !== undefined || tournamentMatchId !== undefined
+          ? toInt(tMatchId ?? tournamentMatchId, null)
+          : undefined,
+      tournamentId:
+        tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
+    };
+
+    // auto-fill when attaching only child id
+    if (data.matchId != null && leagueId === undefined) {
+      const derived = await deriveLeagueIdFromMatchId(data.matchId);
+      if (derived != null) data.leagueId = derived;
+    }
+    if (data.tMatchId != null && tournamentId === undefined) {
+      const derived = await deriveTournamentIdFromTMatchId(data.tMatchId);
+      if (derived != null) data.tournamentId = derived;
+    }
+
+    const updated = await prisma.video.update({ where: { id }, data });
     res.json(updated);
   } catch (e) {
     console.error('POST /videos/:id/attach', e);
@@ -319,6 +446,7 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
     const {
       league = false,
       match = false,
+      tmatch = false,
       tournament = false,
     } = req.body || {};
     const updated = await prisma.video.update({
@@ -326,6 +454,7 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
       data: {
         leagueId: league ? null : undefined,
         matchId: match ? null : undefined,
+        tMatchId: tmatch ? null : undefined,
         tournamentId: tournament ? null : undefined,
       },
     });
@@ -341,15 +470,34 @@ router.post('/bulk', async (req, res) => {
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length) return res.status(400).json({ error: 'Пустой список' });
-    const data = items.map((n) => ({
-      title: n.title ?? null,
-      date: toDate(n.date, new Date()),
-      url: n.url ? String(n.url) : null,
-      videos: toStrArr([...(n.videos || []), ...(n.videosRaw || [])]),
-      leagueId: toInt(n.leagueId, null),
-      matchId: toInt(n.matchId, null),
-      tournamentId: toInt(n.tournamentId, null),
-    }));
+
+    // подготовим данные с авто-деривацией там, где возможно
+    const data = [];
+    for (const n of items) {
+      const _matchId = toInt(n.matchId, null);
+      const _tMatchId = toInt(n.tMatchId ?? n.tournamentMatchId, null);
+      let _leagueId = toInt(n.leagueId, null);
+      let _tournamentId = toInt(n.tournamentId, null);
+
+      if (_matchId && _leagueId == null) {
+        _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+      }
+      if (_tMatchId && _tournamentId == null) {
+        _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+      }
+
+      data.push({
+        title: n.title ?? null,
+        date: toDate(n.date, new Date()),
+        url: n.url ? String(n.url) : null,
+        videos: toStrArr([...(n.videos || []), ...(n.videosRaw || [])]),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
+      });
+    }
+
     const r = await prisma.video.createMany({ data, skipDuplicates: false });
     res.status(201).json({ count: r.count });
   } catch (e) {

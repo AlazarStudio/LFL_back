@@ -33,24 +33,47 @@ const setRaRangeHeaders = (res, name, start, count, total) => {
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
 
-const buildInclude = (includeParam) => {
+const buildIncludeFlags = (includeParam) => {
   const parts = String(includeParam || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   return {
-    league: !!parts.includes('league'),
-    match: !!parts.includes('match'),
-    tournament: !!parts.includes('tournament'),
+    league: parts.includes('league'),
+    match: parts.includes('match'),
+    tmatch: parts.includes('tmatch') || parts.includes('tournamentmatch'),
+    tournament: parts.includes('tournament'),
   };
 };
+const makeInclude = (flags) => {
+  const inc = {};
+  if (flags?.league) inc.league = true;
+  if (flags?.match) inc.match = true;
+  if (flags?.tmatch) inc.tMatch = true;
+  if (flags?.tournament) inc.tournament = true;
+  return inc;
+};
 
-/* ----------------- GET /news -----------------
-Поддержка:
-  1) ?_start=0&_end=9&order=asc&q=term
-  2) ?range=[0,9]&sort=["date","desc"]&filter={"q":"term","id":[1,2],"dateFrom":"2024-01-01","dateTo":"2024-12-31","leagueId":1,"matchId":2,"tournamentId":3,"hasImages":true,"hasVideos":true}
-  3) ?include=league,match,tournament
------------------------------------------------- */
+async function deriveLeagueIdFromMatchId(matchId) {
+  const id = toInt(matchId, null);
+  if (!id) return undefined;
+  const m = await prisma.match.findUnique({
+    where: { id },
+    select: { leagueId: true },
+  });
+  return m?.leagueId ?? undefined;
+}
+async function deriveTournamentIdFromTMatchId(tMatchId) {
+  const id = toInt(tMatchId, null);
+  if (!id) return undefined;
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id },
+    select: { tournamentId: true },
+  });
+  return m?.tournamentId ?? undefined;
+}
+
+/* ----------------- GET /news ----------------- */
 router.get('/', async (req, res) => {
   try {
     const range = safeJSON(req.query.range, null);
@@ -114,6 +137,9 @@ router.get('/', async (req, res) => {
     if (filter.matchId != null && Number.isFinite(Number(filter.matchId))) {
       AND.push({ matchId: Number(filter.matchId) });
     }
+    if (filter.tMatchId != null && Number.isFinite(Number(filter.tMatchId))) {
+      AND.push({ tMatchId: Number(filter.tMatchId) });
+    }
     if (
       filter.tournamentId != null &&
       Number.isFinite(Number(filter.tournamentId))
@@ -130,7 +156,7 @@ router.get('/', async (req, res) => {
     }
 
     const where = AND.length ? { AND } : undefined;
-    const include = buildInclude(req.query.include);
+    const incFlags = buildIncludeFlags(req.query.include);
 
     const [items, total] = await Promise.all([
       prisma.news.findMany({
@@ -138,7 +164,7 @@ router.get('/', async (req, res) => {
         skip: start,
         take,
         orderBy: { [orderField]: orderDir },
-        include,
+        include: makeInclude(incFlags),
       }),
       prisma.news.count({ where }),
     ]);
@@ -156,18 +182,16 @@ router.get('/', async (req, res) => {
   }
 });
 
-/* ----------------- GET /news/latest -----------------
-Быстрый выбор последних N (по date), с include
------------------------------------------------------ */
+/* ----------------- GET /news/latest ----------------- */
 router.get('/latest', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 10)));
-    const include = buildInclude(req.query.include);
+    const incFlags = buildIncludeFlags(req.query.include);
 
     const items = await prisma.news.findMany({
       take: limit,
       orderBy: { date: 'desc' },
-      include,
+      include: makeInclude(incFlags),
     });
     res.json(items);
   } catch (err) {
@@ -176,15 +200,32 @@ router.get('/latest', async (req, res) => {
   }
 });
 
+/* quick by-ids */
+router.get('/by-tmatch/:tMatchId(\\d+)', async (req, res) => {
+  try {
+    const tMatchId = Number(req.params.tMatchId);
+    const rows = await prisma.news.findMany({
+      where: { tMatchId },
+      orderBy: { date: 'desc' },
+    });
+    res.json(rows);
+  } catch (err) {
+    console.error('🔥 Ошибка News GET /by-tmatch:', err);
+    res
+      .status(500)
+      .json({ error: 'Ошибка загрузки новостей по турнирному матчу' });
+  }
+});
+
 /* ----------------- GET /news/:id ----------------- */
-router.get('/:id', async (req, res) => {
+router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (!Number.isFinite(id))
-      return res.status(400).json({ error: 'Некорректный ID' });
-
-    const include = buildInclude(req.query.include);
-    const news = await prisma.news.findUnique({ where: { id }, include });
+    const incFlags = buildIncludeFlags(req.query.include);
+    const news = await prisma.news.findUnique({
+      where: { id },
+      include: makeInclude(incFlags),
+    });
     if (!news) return res.status(404).json({ error: 'Новость не найдена' });
     res.json(news);
   } catch (err) {
@@ -198,13 +239,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-/* ----------------- POST /news -----------------
-Принимает:
-  title, description, date,
-  images / imagesRaw,
-  videos / videosRaw
-  leagueId?, matchId?, tournamentId?
------------------------------------------------- */
+/* ----------------- POST /news ----------------- */
 router.post('/', async (req, res) => {
   try {
     const {
@@ -218,6 +253,8 @@ router.post('/', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
 
     if (!title || typeof title !== 'string') {
@@ -227,6 +264,18 @@ router.post('/', async (req, res) => {
     const parsedDate = toDate(date, new Date());
     if (isNaN(parsedDate))
       return res.status(400).json({ error: 'Некорректная дата' });
+
+    const _matchId = toInt(matchId, null);
+    const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+    let _leagueId = toInt(leagueId, null);
+    let _tournamentId = toInt(tournamentId, null);
+
+    if (_matchId && _leagueId == null) {
+      _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+    }
+    if (_tMatchId && _tournamentId == null) {
+      _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+    }
 
     const imagesFinal = toStringArray([...images, ...imagesRaw]);
     const videosFinal = toStringArray([...videos, ...videosRaw]);
@@ -238,9 +287,10 @@ router.post('/', async (req, res) => {
         date: parsedDate,
         images: imagesFinal,
         videos: videosFinal,
-        leagueId: toInt(leagueId, null),
-        matchId: toInt(matchId, null),
-        tournamentId: toInt(tournamentId, null),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
       },
     });
 
@@ -257,15 +307,10 @@ router.post('/', async (req, res) => {
   }
 });
 
-/* ----------------- PATCH /news/:id -----------------
-Частичное обновление (удобно для RA Edit)
---------------------------------------------------- */
-router.patch('/:id', async (req, res) => {
+/* ----------------- PATCH /news/:id ----------------- */
+router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (!Number.isFinite(id))
-      return res.status(400).json({ error: 'Некорректный ID' });
-
     const {
       title,
       description,
@@ -277,6 +322,8 @@ router.patch('/:id', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
 
     const patch = {};
@@ -291,10 +338,36 @@ router.patch('/:id', async (req, res) => {
       patch.videos = toStringArray([...(videos || []), ...(videosRaw || [])]);
     }
 
-    if (leagueId !== undefined) patch.leagueId = toInt(leagueId, null);
-    if (matchId !== undefined) patch.matchId = toInt(matchId, null);
-    if (tournamentId !== undefined)
-      patch.tournamentId = toInt(tournamentId, null);
+    let _matchId;
+    let _tMatchId;
+    let _leagueId;
+    let _tournamentId;
+
+    if (leagueId !== undefined) {
+      _leagueId = toInt(leagueId, null);
+      patch.leagueId = _leagueId;
+    }
+    if (matchId !== undefined) {
+      _matchId = toInt(matchId, null);
+      patch.matchId = _matchId;
+    }
+    if (tournamentId !== undefined) {
+      _tournamentId = toInt(tournamentId, null);
+      patch.tournamentId = _tournamentId;
+    }
+    if (tMatchId !== undefined || tournamentMatchId !== undefined) {
+      _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+      patch.tMatchId = _tMatchId;
+    }
+
+    if (_matchId != null && leagueId === undefined) {
+      const derived = await deriveLeagueIdFromMatchId(_matchId);
+      if (derived != null) patch.leagueId = derived;
+    }
+    if (_tMatchId != null && tournamentId === undefined) {
+      const derived = await deriveTournamentIdFromTMatchId(_tMatchId);
+      if (derived != null) patch.tournamentId = derived;
+    }
 
     const updated = await prisma.news.update({ where: { id }, data: patch });
     res.json(updated);
@@ -310,14 +383,10 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
-/* ----------------- PUT /news/:id -----------------
-Полная замена полей; images/videos собираются из базовых и *Raw
---------------------------------------------------- */
-router.put('/:id', async (req, res) => {
+/* ----------------- PUT /news/:id ----------------- */
+router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (!Number.isFinite(id))
-      return res.status(400).json({ error: 'Некорректный ID' });
 
     const exists = await prisma.news.findUnique({ where: { id } });
     if (!exists) return res.status(404).json({ error: 'Новость не найдена' });
@@ -333,11 +402,25 @@ router.put('/:id', async (req, res) => {
       leagueId,
       matchId,
       tournamentId,
+      tMatchId,
+      tournamentMatchId,
     } = req.body;
 
     const parsedDate = toDate(date, exists.date);
     if (parsedDate && isNaN(parsedDate))
       return res.status(400).json({ error: 'Некорректная дата' });
+
+    const _matchId = toInt(matchId, null);
+    const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
+    let _leagueId = toInt(leagueId, null);
+    let _tournamentId = toInt(tournamentId, null);
+
+    if (_matchId && _leagueId == null) {
+      _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+    }
+    if (_tMatchId && _tournamentId == null) {
+      _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+    }
 
     const updatedImages = toStringArray([...images, ...imagesRaw]);
     const updatedVideos = toStringArray([...videos, ...videosRaw]);
@@ -350,9 +433,10 @@ router.put('/:id', async (req, res) => {
         date: parsedDate,
         images: updatedImages,
         videos: updatedVideos,
-        leagueId: toInt(leagueId, null),
-        matchId: toInt(matchId, null),
-        tournamentId: toInt(tournamentId, null),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
       },
     });
 
@@ -369,22 +453,34 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-/* ----------------- POST /news/:id/attach -----------------
-Быстрая привязка к лиге/матчу/турниру (любые можно указать)
------------------------------------------------------------ */
-router.post('/:id/attach', async (req, res) => {
+/* ----------------- POST /news/:id/attach ----------------- */
+router.post('/:id(\\d+)/attach', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { leagueId, matchId, tournamentId } = req.body;
-    const updated = await prisma.news.update({
-      where: { id },
-      data: {
-        leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
-        matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
-        tournamentId:
-          tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
-      },
-    });
+    const { leagueId, matchId, tournamentId, tMatchId, tournamentMatchId } =
+      req.body;
+
+    const data = {
+      leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
+      matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
+      tMatchId:
+        tMatchId !== undefined || tournamentMatchId !== undefined
+          ? toInt(tMatchId ?? tournamentMatchId, null)
+          : undefined,
+      tournamentId:
+        tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
+    };
+
+    if (data.matchId != null && leagueId === undefined) {
+      const derived = await deriveLeagueIdFromMatchId(data.matchId);
+      if (derived != null) data.leagueId = derived;
+    }
+    if (data.tMatchId != null && tournamentId === undefined) {
+      const derived = await deriveTournamentIdFromTMatchId(data.tMatchId);
+      if (derived != null) data.tournamentId = derived;
+    }
+
+    const updated = await prisma.news.update({ where: { id }, data });
     res.json(updated);
   } catch (err) {
     console.error('🔥 Ошибка News attach:', err);
@@ -392,15 +488,14 @@ router.post('/:id/attach', async (req, res) => {
   }
 });
 
-/* ----------------- POST /news/:id/detach -----------------
-Снять привязку (по ключам в body)
------------------------------------------------------------ */
-router.post('/:id/detach', async (req, res) => {
+/* ----------------- POST /news/:id/detach ----------------- */
+router.post('/:id(\\d+)/detach', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const {
       league = false,
       match = false,
+      tmatch = false,
       tournament = false,
     } = req.body || {};
     const updated = await prisma.news.update({
@@ -408,6 +503,7 @@ router.post('/:id/detach', async (req, res) => {
       data: {
         leagueId: league ? null : undefined,
         matchId: match ? null : undefined,
+        tMatchId: tmatch ? null : undefined,
         tournamentId: tournament ? null : undefined,
       },
     });
@@ -418,30 +514,40 @@ router.post('/:id/detach', async (req, res) => {
   }
 });
 
-/* ----------------- BULK create -----------------
-POST /news/bulk  body: { items: [ { ... как в POST /news } ] }
--------------------------------------------------- */
+/* ----------------- BULK create ----------------- */
 router.post('/bulk', async (req, res) => {
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length) return res.status(400).json({ error: 'Пустой список' });
 
-    const payload = items.map((n) => ({
-      title: n.title,
-      description: n.description,
-      date: toDate(n.date, new Date()),
-      images: toStringArray([...(n.images || []), ...(n.imagesRaw || [])]),
-      videos: toStringArray([...(n.videos || []), ...(n.videosRaw || [])]),
-      leagueId: toInt(n.leagueId, null),
-      matchId: toInt(n.matchId, null),
-      tournamentId: toInt(n.tournamentId, null),
-    }));
+    const data = [];
+    for (const n of items) {
+      const _matchId = toInt(n.matchId, null);
+      const _tMatchId = toInt(n.tMatchId ?? n.tournamentMatchId, null);
+      let _leagueId = toInt(n.leagueId, null);
+      let _tournamentId = toInt(n.tournamentId, null);
 
-    // createMany не возвращает записи; вернём count
-    const result = await prisma.news.createMany({
-      data: payload,
-      skipDuplicates: true,
-    });
+      if (_matchId && _leagueId == null) {
+        _leagueId = await deriveLeagueIdFromMatchId(_matchId);
+      }
+      if (_tMatchId && _tournamentId == null) {
+        _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
+      }
+
+      data.push({
+        title: n.title,
+        description: n.description,
+        date: toDate(n.date, new Date()),
+        images: toStringArray([...(n.images || []), ...(n.imagesRaw || [])]),
+        videos: toStringArray([...(n.videos || []), ...(n.videosRaw || [])]),
+        leagueId: _leagueId ?? null,
+        matchId: _matchId ?? null,
+        tMatchId: _tMatchId ?? null,
+        tournamentId: _tournamentId ?? null,
+      });
+    }
+
+    const result = await prisma.news.createMany({ data, skipDuplicates: true });
     res.status(201).json({ count: result.count });
   } catch (err) {
     console.error('🔥 Ошибка News BULK POST:', err);
@@ -449,9 +555,7 @@ router.post('/bulk', async (req, res) => {
   }
 });
 
-/* ----------------- BULK delete -----------------
-DELETE /news/bulk?ids=[1,2,3]
--------------------------------------------------- */
+/* ----------------- BULK delete ----------------- */
 router.delete('/bulk', async (req, res) => {
   try {
     const ids = safeJSON(req.query.ids, []).map(Number).filter(Number.isFinite);
@@ -465,11 +569,9 @@ router.delete('/bulk', async (req, res) => {
 });
 
 /* ----------------- DELETE /news/:id ----------------- */
-router.delete('/:id', async (req, res) => {
+router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (!Number.isFinite(id))
-      return res.status(400).json({ error: 'Некорректный ID' });
     await prisma.news.delete({ where: { id } });
     res.json({ success: true });
   } catch (err) {
