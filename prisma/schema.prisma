@@ -491,6 +491,7 @@ model News {
 
   @@index([leagueId])
   @@index([matchId])
+  @@index([tMatchId])
   @@index([tournamentId])
 }
 
@@ -514,6 +515,7 @@ model Photo {
 
   @@index([leagueId])
   @@index([matchId])
+  @@index([tMatchId])
   @@index([tournamentId])
 }
 
@@ -539,6 +541,7 @@ model Video {
 
   @@index([leagueId])
   @@index([matchId])
+  @@index([tMatchId])
   @@index([tournamentId])
 }
 

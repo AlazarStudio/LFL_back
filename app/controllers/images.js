@@ -16,7 +16,10 @@ const safeJSON = (v, fb) => {
 const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
 const toDate = (v, d = undefined) => (v ? new Date(v) : d);
 const setRange = (res, name, start, count, total) => {
-  res.setHeader('Content-Range', `${name} ${start}-${start + count - 1}/${total}`);
+  res.setHeader(
+    'Content-Range',
+    `${name} ${start}-${start + count - 1}/${total}`
+  );
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
 // принимает строку или объект {src|url|path} -> массив строк
@@ -51,13 +54,19 @@ const makeInclude = (flags) => {
 async function deriveLeagueIdFromMatchId(matchId) {
   const id = toInt(matchId, null);
   if (!id) return undefined;
-  const m = await prisma.match.findUnique({ where: { id }, select: { leagueId: true } });
+  const m = await prisma.match.findUnique({
+    where: { id },
+    select: { leagueId: true },
+  });
   return m?.leagueId ?? undefined;
 }
 async function deriveTournamentIdFromTMatchId(tMatchId) {
   const id = toInt(tMatchId, null);
   if (!id) return undefined;
-  const m = await prisma.tournamentMatch.findUnique({ where: { id }, select: { tournamentId: true } });
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id },
+    select: { tournamentId: true },
+  });
   return m?.tournamentId ?? undefined;
 }
 
@@ -78,7 +87,8 @@ router.get('/', async (req, res) => {
     const take = Math.max(0, end - start + 1);
 
     const sortField = String(sort[0] || 'date');
-    const sortOrder = String(sort[1] || 'DESC').toLowerCase() === 'desc' ? 'desc' : 'asc';
+    const sortOrder =
+      String(sort[1] || 'DESC').toLowerCase() === 'desc' ? 'desc' : 'asc';
     const incFlags = buildIncludeFlags(req.query.include);
 
     const AND = [];
@@ -88,7 +98,9 @@ router.get('/', async (req, res) => {
     const q = (req.query.q ?? filter.q ?? '').toString().trim();
     if (q) AND.push({ OR: [{ title: { contains: q, mode: 'insensitive' } }] });
     if (typeof filter.title === 'string' && filter.title.trim()) {
-      AND.push({ title: { contains: filter.title.trim(), mode: 'insensitive' } });
+      AND.push({
+        title: { contains: filter.title.trim(), mode: 'insensitive' },
+      });
     }
     if (filter.date_gte || filter.date_lte) {
       AND.push({
@@ -107,7 +119,10 @@ router.get('/', async (req, res) => {
     if (filter.tMatchId != null && Number.isFinite(Number(filter.tMatchId))) {
       AND.push({ tMatchId: Number(filter.tMatchId) });
     }
-    if (filter.tournamentId != null && Number.isFinite(Number(filter.tournamentId))) {
+    if (
+      filter.tournamentId != null &&
+      Number.isFinite(Number(filter.tournamentId))
+    ) {
       AND.push({ tournamentId: Number(filter.tournamentId) });
     }
     if (filter.hasImages === true || String(filter.hasImages) === 'true') {
@@ -209,7 +224,10 @@ router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const incFlags = buildIncludeFlags(req.query.include);
-    const item = await prisma.photo.findUnique({ where: { id }, include: makeInclude(incFlags) });
+    const item = await prisma.photo.findUnique({
+      where: { id },
+      include: makeInclude(incFlags),
+    });
     if (!item) return res.status(404).json({ error: 'Не найдено' });
     res.json(item);
   } catch (e) {
@@ -267,8 +285,17 @@ router.post('/', async (req, res) => {
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { title, date, images, imagesRaw, leagueId, matchId, tournamentId, tMatchId, tournamentMatchId } =
-      req.body;
+    const {
+      title,
+      date,
+      images,
+      imagesRaw,
+      leagueId,
+      matchId,
+      tournamentId,
+      tMatchId,
+      tournamentMatchId,
+    } = req.body;
 
     const patch = {};
     if (title !== undefined) patch.title = title;
@@ -277,7 +304,10 @@ router.patch('/:id(\\d+)', async (req, res) => {
       patch.images = toStrArr([...(images || []), ...(imagesRaw || [])]);
     }
 
-    let _matchId, _tMatchId, _leagueId, _tournamentId;
+    let _matchId;
+    let _tMatchId;
+    let _leagueId;
+    let _tournamentId;
 
     if (leagueId !== undefined) {
       _leagueId = toInt(leagueId, null);
@@ -364,7 +394,8 @@ router.put('/:id(\\d+)', async (req, res) => {
 router.post('/:id(\\d+)/attach', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { leagueId, matchId, tournamentId, tMatchId, tournamentMatchId } = req.body || {};
+    const { leagueId, matchId, tournamentId, tMatchId, tournamentMatchId } =
+      req.body || {};
     const data = {
       leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
       matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
@@ -372,7 +403,8 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
         tMatchId !== undefined || tournamentMatchId !== undefined
           ? toInt(tMatchId ?? tournamentMatchId, null)
           : undefined,
-      tournamentId: tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
+      tournamentId:
+        tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
     };
 
     if (data.matchId != null && leagueId === undefined) {
@@ -394,7 +426,12 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
 router.post('/:id(\\d+)/detach', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { league = false, match = false, tmatch = false, tournament = false } = req.body || {};
+    const {
+      league = false,
+      match = false,
+      tmatch = false,
+      tournament = false,
+    } = req.body || {};
     const updated = await prisma.photo.update({
       where: { id },
       data: {
@@ -433,7 +470,7 @@ router.post('/bulk', async (req, res) => {
 
       data.push({
         title: n.title ?? null,
-        date: toDate(n.date, new Date())),
+        date: toDate(n.date, new Date()),
         images: toStrArr([...(n.images || []), ...(n.imagesRaw || [])]),
         leagueId: _leagueId ?? null,
         matchId: _matchId ?? null,
