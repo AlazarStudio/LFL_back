@@ -1542,17 +1542,19 @@ router.post('/tournament-groups/:groupId(\\d+)/generate', async (req, res) => {
       const { a, b, tour } = pairList[i]; // ✅
       const when = slots[i];
 
-    const m = await prisma.tournamentMatch.create({
-    data: {
-      date: when,
-      status: 'SCHEDULED',
-      tour,
-      tournament: { connect: { id: g.tournamentId } },
-      group: { connect: { id: g.id } },
-      team1TT: { connect: { id: a } },
-      team2TT: { connect: { id: b } },
-      ...(genStadiumId ? { stadiumRel: { connect: { id: genStadiumId } } } : {}),
-    },
+      const m = await prisma.tournamentMatch.create({
+        data: {
+          date: when,
+          status: 'SCHEDULED',
+          tour,
+          tournament: { connect: { id: g.tournamentId } },
+          group: { connect: { id: g.id } },
+          team1TT: { connect: { id: a } },
+          team2TT: { connect: { id: b } },
+          ...(genStadiumId
+            ? { stadiumRel: { connect: { id: genStadiumId } } }
+            : {}),
+        },
       });
       created.push(m);
 

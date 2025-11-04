@@ -156,6 +156,10 @@ model Team {
   leagues        LeagueTeam[]
   invites        TeamInvite[]
   TournamentTeam TournamentTeam[]
+
+  News  News[]
+  Photo Photo[]
+  Video Video[]
 }
 
 model Player {
@@ -477,6 +481,7 @@ model News {
   images      String[] @default([])
   videos      String[] @default([])
   date        DateTime @default(now())
+  url         String?
 
   leagueId Int?
   league   League? @relation(fields: [leagueId], references: [id], onDelete: SetNull)
@@ -488,6 +493,9 @@ model News {
 
   tMatchId Int?
   tMatch   TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
+
+  teamId Int?
+  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
@@ -512,6 +520,9 @@ model Photo {
   tMatch       TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
   tournamentId Int?
   tournament   Tournament?      @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+
+  teamId Int?
+  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
@@ -538,6 +549,9 @@ model Video {
 
   tMatchId Int?
   tMatch   TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
+
+  teamId Int?
+  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
