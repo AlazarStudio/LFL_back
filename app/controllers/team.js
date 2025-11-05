@@ -281,15 +281,34 @@ router.put('/:id', async (req, res) => {
       .filter(Boolean);
 
     const patch = {};
+
+    // простые поля
     if (title !== undefined) patch.title = title;
     if (city !== undefined) patch.city = city;
-    if (logo.length || logoRaw.length) patch.logo = finalLogo;
-    if (images.length || imagesRaw.length) patch.images = finalImages;
 
-    // позволяем и обновить, и очистить short name
+    // ВАЖНО: обновляем массивы, если ключи присланы (даже пустые → очистка)
+    const hasLogoKeys =
+      Object.prototype.hasOwnProperty.call(req.body, 'logo') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'logoRaw');
+    const hasImagesKeys =
+      Object.prototype.hasOwnProperty.call(req.body, 'images') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'imagesRaw');
+
+    if (hasLogoKeys) {
+      // Если logo: String[] в Prisma
+      patch.logo = { set: finalLogo };
+      // Если logo: Json — используй: patch.logo = finalLogo;
+    }
+    if (hasImagesKeys) {
+      // Если images: String[] в Prisma
+      patch.images = { set: finalImages };
+      // Если images: Json — используй: patch.images = finalImages;
+    }
+
+    // короткое имя: пустая строка -> null
     if (smallTitle !== undefined) {
       const st = normStr(smallTitle);
-      patch.smallTitle = st ?? null; // пустая строка → null
+      patch.smallTitle = st ?? null;
     }
 
     const games = toInt(req.body.games);
