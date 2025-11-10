@@ -334,24 +334,14 @@ export function initSocket(httpServer, { prisma } = {}) {
     /* ====== Часы ====== */
     socket.on('tmatch:clock:get', async ({ matchId }, ack) => {
       const id = Number(matchId);
-
-      let st = clocks.get(id);
-      if (!st) {
-        st = await buildDefaultClockFromDB(id);
-        clocks.set(id, st);
-      }
-
-      // На всякий случай подтягиваем свежие значения из турнира (если их меняли)
+      let st = clocks.get(id) || (await buildDefaultClockFromDB(id));
       const cfg = await getTournamentClockConfig(id);
-      if (st.halfMinutes !== cfg.halfMinutes || st.halves !== cfg.halves) {
-        st = enrichClock({
-          ...st,
-          halfMinutes: cfg.halfMinutes,
-          halves: cfg.halves,
-        });
-        clocks.set(id, st);
-      }
-
+      st = enrichClock({
+        ...st,
+        halfMinutes: Number(cfg.halfMinutes),
+        halves: Number(cfg.halves),
+      });
+      clocks.set(id, st);
       ack && ack(st);
       socket.emit('tmatch:clock', st);
     });
@@ -473,8 +463,9 @@ export async function setClock(matchId, statePatch) {
 
   // ⬇️ КЛЮЧ: при переходе на следующий тайм сбрасываем локальную базу и добавленное время.
   if (prev && halfChanged && patch.baseElapsedSec == null) {
-    patch.baseElapsedSec = 0; // локально тайм начинается с 0:00
-    patch.addedSec = 0; // компенсированное время не переносим
+    patch.baseElapsedSec = 0;
+    patch.addedSec = 0;
+    if (!patch.phase) patch.phase = nextHalf === 2 ? 'H2' : `H${nextHalf}`;
   }
 
   const next = enrichClock(normClock({ matchId: id, ...prev, ...patch }));
