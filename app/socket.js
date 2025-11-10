@@ -457,9 +457,8 @@ export function getIO() {
 export async function setClock(matchId, statePatch) {
   const id = Number(matchId);
   const prev = clocks.get(id);
-  const cfg = await getTournamentClockConfig(id); // { halfMinutes, halves }
+  const cfg = await getTournamentClockConfig(id);
 
-  // гарантируем турнирные настройки
   const patch = {
     ...statePatch,
     halfMinutes: Number(
@@ -468,20 +467,14 @@ export async function setClock(matchId, statePatch) {
     halves: Number(statePatch?.halves ?? prev?.halves ?? cfg.halves),
   };
 
-  // если меняем тайм/фазу — переносим базу на конец прошлого тайма,
-  // чтобы второй (и далее) начинался не с 0, а с конца предыдущего
   const prevHalf = Number(prev?.half ?? 1);
   const nextHalf = Number(patch?.half ?? prevHalf);
-  const phaseChanged =
-    (patch?.phase && patch.phase !== prev?.phase) || nextHalf !== prevHalf;
+  const halfChanged = nextHalf !== prevHalf;
 
-  if (phaseChanged && patch.baseElapsedSec == null && prev) {
-    const hm =
-      Number(prev?.halfMinutes ?? patch.halfMinutes ?? cfg.halfMinutes) || 45;
-    const prevBase = Math.max(0, Number(prev?.baseElapsedSec ?? 0));
-    const prevAdded = Math.max(0, Number(prev?.addedSec ?? 0));
-    const prevDisplayBase = prevBase + prevAdded + (prevHalf - 1) * hm * 60;
-    patch.baseElapsedSec = prevDisplayBase; // <- ключевая строка
+  // ⬇️ КЛЮЧ: при переходе на следующий тайм сбрасываем локальную базу и добавленное время.
+  if (prev && halfChanged && patch.baseElapsedSec == null) {
+    patch.baseElapsedSec = 0; // локально тайм начинается с 0:00
+    patch.addedSec = 0; // компенсированное время не переносим
   }
 
   const next = enrichClock(normClock({ matchId: id, ...prev, ...patch }));
