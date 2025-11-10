@@ -5,7 +5,7 @@ import { PrismaClient } from '@prisma/client';
 const router = Router();
 const prisma = new PrismaClient();
 
-/* ------------ utils ------------ */
+/* ---------- utils ---------- */
 const safeJSON = (v, fb) => {
   try {
     return v ? JSON.parse(String(v)) : fb;
@@ -13,59 +13,46 @@ const safeJSON = (v, fb) => {
     return fb;
   }
 };
-const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
-const toDate = (v) => (v ? new Date(v) : undefined);
+const toInt = (v, d) => (v === '' || v == null ? d : Number(v));
+const toDate = (v, d) => (v ? new Date(v) : d);
 const bool = (v) =>
-  ['true', '1', 'yes', 'on'].includes(String(v).toLowerCase());
+  ['true', '1', 'yes', 'on', true, 1].includes(String(v).toLowerCase());
+const toStrArr = (val) =>
+  (Array.isArray(val) ? val : [val])
+    .filter(Boolean)
+    .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
+    .filter(Boolean);
 const setRange = (res, name, start, count, total) => {
-  res.setHeader(
-    'Content-Range',
-    `${name} ${start}-${start + count - 1}/${total}`
-  );
+  const from = total === 0 ? 0 : start;
+  const to = total === 0 ? 0 : start + Math.max(0, count - 1);
+  res.setHeader('Content-Range', `${name} ${from}-${to}/${total}`);
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
 
-/* ------------ roles helper (для отбора главных и т.п.) ------------ */
-// Подстрой под реальные значения ролей "главного" у тебя в базе
+/* ---------- roles helper ---------- */
 const defaultMainRoles = ['MAIN', 'REFEREE', 'CHIEF', 'HEAD'];
 const parseRoles = (req) => {
-  // допускаем JSON-массив в roles или строку "MAIN,FOURTH"
   const raw = req.query.roles;
   const parsed = safeJSON(raw, null);
   if (Array.isArray(parsed) && parsed.length) return parsed.map(String);
-  if (typeof raw === 'string' && raw.trim().length) {
+  if (typeof raw === 'string' && raw.trim()) {
     return raw
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
   }
   const onlyMain = req.query.onlyMain == null ? true : bool(req.query.onlyMain);
-  return onlyMain ? defaultMainRoles : undefined; // undefined = любые роли
+  return onlyMain ? defaultMainRoles : undefined;
 };
 
 /* =========================================================
    LIST  GET /referees
-   filter:
-     id: [1,2] | q | name | leagueId | role | date_gte/lte | hasMatches
-   sort:
-     ["id"|"name"|"createdAt"|"matches","ASC"|"DESC"]
-   ========================================================= */
+========================================================= */
 router.get('/', async (req, res) => {
   try {
-    const safeJSON = (v, fb) => {
-      try {
-        return v ? JSON.parse(String(v)) : fb;
-      } catch {
-        return fb;
-      }
-    };
-    const bool = (v) =>
-      ['true', '1', 'yes', 'on'].includes(String(v).toLowerCase());
-
     const range = safeJSON(req.query.range, [0, 9999]);
     const sort = safeJSON(req.query.sort, ['id', 'ASC']);
     const filter = safeJSON(req.query.filter, {});
-
     const [start, end] = range;
     const take = Math.max(0, end - start + 1);
 
@@ -88,7 +75,6 @@ router.get('/', async (req, res) => {
       AND.push({ name: { contains: filter.name.trim(), mode: 'insensitive' } });
     }
 
-    // Фильтры по лиговым назначениями (через relation matchRefs)
     const matchSubWhere = {};
     if (filter.leagueId != null && Number.isFinite(Number(filter.leagueId))) {
       matchSubWhere.match = {
@@ -106,18 +92,15 @@ router.get('/', async (req, res) => {
         },
       };
     }
-    if (Object.keys(matchSubWhere).length) {
+    if (Object.keys(matchSubWhere).length)
       AND.push({ matchRefs: { some: matchSubWhere } });
-    }
 
-    // hasMatches — учитываем и турнирные через предварительный список id из groupBy
-    let tAssignedIds = null;
     if (filter.hasMatches != null) {
       const tAgg = await prisma.tournamentMatchReferee.groupBy({
         by: ['refereeId'],
         _count: { _all: true },
       });
-      tAssignedIds = new Set(tAgg.map((r) => r.refereeId));
+      const tAssignedIds = new Set(tAgg.map((r) => r.refereeId));
       if (bool(filter.hasMatches)) {
         AND.push({
           OR: [{ matchRefs: { some: {} } }, { id: { in: [...tAssignedIds] } }],
@@ -134,7 +117,6 @@ router.get('/', async (req, res) => {
 
     const where = AND.length ? { AND } : undefined;
 
-    // Основной список (только лиговый _count — он гарантированно есть)
     const [rows, total] = await Promise.all([
       prisma.referee.findMany({
         skip: start,
@@ -146,7 +128,6 @@ router.get('/', async (req, res) => {
       prisma.referee.count({ where }),
     ]);
 
-    // Подтягиваем турнирные количества для этих ID
     const ids = rows.map((r) => r.id);
     const tCounts = ids.length
       ? await prisma.tournamentMatchReferee.groupBy({
@@ -157,7 +138,6 @@ router.get('/', async (req, res) => {
       : [];
     const tMap = new Map(tCounts.map((r) => [r.refereeId, r._count._all]));
 
-    // Сливаем в _totals (league + tournament + total)
     const out = rows.map((r) => {
       const league = r._count?.matchRefs ?? 0;
       const tournament = tMap.get(r.id) ?? 0;
@@ -167,11 +147,7 @@ router.get('/', async (req, res) => {
       };
     });
 
-    res.setHeader(
-      'Content-Range',
-      `referees ${start}-${start + rows.length - 1}/${total}`
-    );
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
+    setRange(res, 'referees', start, rows.length, total);
     res.json(out);
   } catch (e) {
     console.error('GET /referees', e);
@@ -179,9 +155,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-/* =========================================================
-   QUICK SEARCH  GET /referees/search?q=...
-   ========================================================= */
+/* QUICK SEARCH */
 router.get('/search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
@@ -199,9 +173,7 @@ router.get('/search', async (req, res) => {
   }
 });
 
-/* =========================================================
-   ITEM  GET /referees/:id
-   ========================================================= */
+/* ITEM */
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -210,13 +182,11 @@ router.get('/:id(\\d+)', async (req, res) => {
       include: { _count: { select: { matchRefs: true } } },
     });
     if (!item) return res.status(404).json({ error: 'Not found' });
-
     const tCount = await prisma.tournamentMatchReferee.count({
       where: { refereeId: id },
     });
     const league = item._count?.matchRefs ?? 0;
     const tournament = tCount ?? 0;
-
     res.json({
       ...item,
       _totals: { league, tournament, total: league + tournament },
@@ -227,14 +197,11 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   STATS  GET /referees/:id/stats
-   ========================================================= */
+/* STATS */
 router.get('/:id(\\d+)/stats', async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // ---- агрегаты по лигам ----
     const byLeague = await prisma.matchReferee.groupBy({
       by: ['role', 'matchId'],
       where: { refereeId: id },
@@ -252,7 +219,7 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
     const leagueMap = new Map(matches.map((m) => [m.id, m.leagueId]));
     const leagueAgg = {};
     byLeague.forEach((r) => {
-      const lid = leagueMap.get(r.matchId) ?? null;
+      const lid = leagueMap.get(r.matchId);
       if (!lid) return;
       leagueAgg[lid] ||= { leagueId: lid, total: 0, byRole: {} };
       leagueAgg[lid].total += 1;
@@ -260,7 +227,6 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
         (leagueAgg[lid].byRole[r.role || 'UNKNOWN'] || 0) + 1;
     });
 
-    // ---- агрегаты по турнирам ----
     const byTournamentMatch = await prisma.tournamentMatchReferee.groupBy({
       by: ['role', 'matchId'],
       where: { refereeId: id },
@@ -278,7 +244,7 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
     const tMap = new Map(tMatches.map((m) => [m.id, m.tournamentId]));
     const tournAgg = {};
     byTournamentMatch.forEach((r) => {
-      const tid = tMap.get(r.matchId) ?? null;
+      const tid = tMap.get(r.matchId);
       if (!tid) return;
       tournAgg[tid] ||= { tournamentId: tid, total: 0, byRole: {} };
       tournAgg[tid].total += 1;
@@ -286,8 +252,7 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
         (tournAgg[tid].byRole[r.role || 'UNKNOWN'] || 0) + 1;
     });
 
-    // ---- карточки с фильтрами ----
-    const roles = parseRoles(req); // по умолчанию — главные
+    const roles = parseRoles(req);
     const date_gte = req.query.date_gte
       ? new Date(req.query.date_gte)
       : undefined;
@@ -297,16 +262,12 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
     const leagueId = toInt(req.query.leagueId, undefined);
     const tournamentId = toInt(req.query.tournamentId, undefined);
 
-    // ЛИГОВЫЕ карточки (MatchEvent → match)
     const leagueMatchFilter = {
       match: {
         ...(leagueId != null ? { leagueId } : {}),
         date: { gte: date_gte, lte: date_lte },
         matchReferees: {
-          some: {
-            refereeId: id,
-            ...(roles ? { role: { in: roles } } : {}),
-          },
+          some: { refereeId: id, ...(roles ? { role: { in: roles } } : {}) },
         },
       },
     };
@@ -319,16 +280,12 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
       }),
     ]);
 
-    // ТУРНИРНЫЕ карточки (TournamentMatchEvent → match)
     const tMatchFilter = {
       match: {
         ...(tournamentId != null ? { tournamentId } : {}),
         date: { gte: date_gte, lte: date_lte },
         referees: {
-          some: {
-            refereeId: id,
-            ...(roles ? { role: { in: roles } } : {}),
-          },
+          some: { refereeId: id, ...(roles ? { role: { in: roles } } : {}) },
         },
       },
     };
@@ -341,31 +298,6 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
       }),
     ]);
 
-    const cards = {
-      league: {
-        yellow: leagueYellow,
-        red: leagueRed,
-        total: leagueYellow + leagueRed,
-      },
-      tournament: {
-        yellow: tournamentYellow,
-        red: tournamentRed,
-        total: tournamentYellow + tournamentRed,
-      },
-      total: {
-        yellow: leagueYellow + tournamentYellow,
-        red: leagueRed + tournamentRed,
-        total: leagueYellow + tournamentYellow + leagueRed + tournamentRed,
-      },
-      _filters: {
-        roles: roles || 'ANY',
-        date_gte: date_gte || null,
-        date_lte: date_lte || null,
-        leagueId: leagueId ?? null,
-        tournamentId: tournamentId ?? null,
-      },
-    };
-
     res.json({
       leagues: Object.values(leagueAgg),
       tournaments: Object.values(tournAgg),
@@ -373,7 +305,30 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
         leagueMatches: matchIds.length,
         tournamentMatches: tMatchIds.length,
       },
-      cards,
+      cards: {
+        league: {
+          yellow: leagueYellow,
+          red: leagueRed,
+          total: leagueYellow + leagueRed,
+        },
+        tournament: {
+          yellow: tournamentYellow,
+          red: tournamentRed,
+          total: tournamentYellow + tournamentRed,
+        },
+        total: {
+          yellow: leagueYellow + tournamentYellow,
+          red: leagueRed + tournamentRed,
+          total: leagueYellow + tournamentYellow + leagueRed + tournamentRed,
+        },
+        _filters: {
+          roles: roles || 'ANY',
+          date_gte: date_gte || null,
+          date_lte: date_lte || null,
+          leagueId: leagueId ?? null,
+          tournamentId: tournamentId ?? null,
+        },
+      },
     });
   } catch (e) {
     console.error('GET /referees/:id/stats', e);
@@ -381,9 +336,7 @@ router.get('/:id(\\d+)/stats', async (req, res) => {
   }
 });
 
-/* =========================================================
-   CARDS-ONLY  GET /referees/:id/cards
-   ========================================================= */
+/* CARDS-ONLY */
 router.get('/:id(\\d+)/cards', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -462,23 +415,16 @@ router.get('/:id(\\d+)/cards', async (req, res) => {
   }
 });
 
-/* =========================================================
-   MATCHES of referee (лиговые): GET /referees/:id/matches
-   ========================================================= */
+/* MATCHES (league) */
 router.get('/:id(\\d+)/matches', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const range = safeJSON(req.query.range, [0, 49]);
     const [start, end] = range;
-    const take = Math.max(0, end - start + 1);
-
     const AND = [{ refereeId: id }];
-    if (req.query.leagueId != null) {
+    if (req.query.leagueId != null)
       AND.push({ match: { leagueId: Number(req.query.leagueId) } });
-    }
-    if (req.query.role) {
-      AND.push({ role: req.query.role });
-    }
+    if (req.query.role) AND.push({ role: req.query.role });
     if (req.query.date_gte || req.query.date_lte) {
       AND.push({
         match: {
@@ -495,7 +441,7 @@ router.get('/:id(\\d+)/matches', async (req, res) => {
       prisma.matchReferee.findMany({
         where,
         skip: start,
-        take,
+        take: Math.max(0, end - start + 1),
         orderBy: [{ match: { date: 'desc' } }],
         include: {
           match: {
@@ -518,20 +464,15 @@ router.get('/:id(\\d+)/matches', async (req, res) => {
   }
 });
 
-/* =========================================================
-   TOURNAMENT matches of referee: GET /referees/:id/tournament-matches
-   ========================================================= */
+/* TOURNAMENT matches */
 router.get('/:id(\\d+)/tournament-matches', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const range = safeJSON(req.query.range, [0, 49]);
     const [start, end] = range;
-    const take = Math.max(0, end - start + 1);
-
     const AND = [{ refereeId: id }];
-    if (req.query.tournamentId != null) {
+    if (req.query.tournamentId != null)
       AND.push({ match: { tournamentId: Number(req.query.tournamentId) } });
-    }
     if (req.query.role) AND.push({ role: req.query.role });
     if (req.query.date_gte || req.query.date_lte) {
       AND.push({
@@ -549,7 +490,7 @@ router.get('/:id(\\d+)/tournament-matches', async (req, res) => {
       prisma.tournamentMatchReferee.findMany({
         where,
         skip: start,
-        take,
+        take: Math.max(0, end - start + 1),
         orderBy: [{ match: { date: 'desc' } }],
         include: {
           match: {
@@ -577,15 +518,15 @@ router.get('/:id(\\d+)/tournament-matches', async (req, res) => {
 });
 
 /* =========================================================
-   CREATE  POST /referees
-   ========================================================= */
+   CREATE / UPDATE / DELETE
+========================================================= */
 router.post('/', async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, images = [] } = req.body;
     if (!name || !name.trim())
       return res.status(400).json({ error: 'name обязателен' });
     const created = await prisma.referee.create({
-      data: { name: name.trim() },
+      data: { name: name.trim(), images: toStrArr(images) },
     });
     res.status(201).json(created);
   } catch (e) {
@@ -594,14 +535,12 @@ router.post('/', async (req, res) => {
   }
 });
 
-/* =========================================================
-   PATCH  /referees/:id  (частичное)
-   ========================================================= */
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const patch = {};
     if (req.body.name !== undefined) patch.name = req.body.name;
+    if (req.body.images !== undefined) patch.images = toStrArr(req.body.images);
     const updated = await prisma.referee.update({ where: { id }, data: patch });
     res.json(updated);
   } catch (e) {
@@ -610,16 +549,13 @@ router.patch('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   PUT  /referees/:id  (полная замена)
-   ========================================================= */
 router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { name } = req.body;
+    const { name, images = [] } = req.body;
     const updated = await prisma.referee.update({
       where: { id },
-      data: { name },
+      data: { name, images: toStrArr(images) },
     });
     res.json(updated);
   } catch (e) {
@@ -628,9 +564,6 @@ router.put('/:id(\\d+)', async (req, res) => {
   }
 });
 
-/* =========================================================
-   DELETE  /referees/:id
-   ========================================================= */
 router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -643,37 +576,117 @@ router.delete('/:id(\\d+)', async (req, res) => {
 });
 
 /* =========================================================
-   ASSIGN / DETACH к матчу/турматчу
-   POST /referees/:id/assign   { matchId?, tournamentMatchId?, role? }
-   DELETE /referees/:id/assign?matchId=... | ?tournamentMatchId=...
-   ========================================================= */
+   IMAGES: append / remove / reorder (как у игрока)
+========================================================= */
+
+// append images (добавить в конец массива)
+router.post('/:id(\\d+)/images', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const add = toStrArr(req.body?.images || []);
+    if (!add.length) return res.status(400).json({ error: 'Нечего добавлять' });
+
+    const cur = await prisma.referee.findUnique({
+      where: { id },
+      select: { images: true },
+    });
+    if (!cur) return res.status(404).json({ error: 'Referee not found' });
+
+    const next = [...(cur.images || []), ...add];
+    const updated = await prisma.referee.update({
+      where: { id },
+      data: { images: next },
+      select: { id: true, images: true },
+    });
+    res.json(updated);
+  } catch (e) {
+    console.error('POST /referees/:id/images', e);
+    res.status(500).json({ error: 'Не удалось добавить фото' });
+  }
+});
+
+// remove by path OR by index
+router.delete('/:id(\\d+)/images', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const byPath = String(req.query.path || '').trim();
+    const byIndex =
+      req.query.index != null && Number.isFinite(Number(req.query.index))
+        ? Number(req.query.index)
+        : null;
+
+    if (!byPath && byIndex == null)
+      return res.status(400).json({ error: 'Нужен path или index' });
+
+    const row = await prisma.referee.findUnique({
+      where: { id },
+      select: { images: true },
+    });
+    if (!row) return res.status(404).json({ error: 'Referee not found' });
+
+    let next = [...(row.images || [])];
+    if (byPath) next = next.filter((p) => p !== byPath);
+    if (byIndex != null) next = next.filter((_, i) => i !== byIndex);
+
+    const updated = await prisma.referee.update({
+      where: { id },
+      data: { images: next },
+      select: { id: true, images: true },
+    });
+
+    // опционально: удалить файл(ы) с диска, если есть утилита deleteFiles([...])
+    res.json(updated);
+  } catch (e) {
+    console.error('DELETE /referees/:id/images', e);
+    res.status(500).json({ error: 'Не удалось удалить фото' });
+  }
+});
+
+// reorder (set full array)
+router.patch('/:id(\\d+)/images/reorder', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const ordered = toStrArr(req.body?.images || []);
+    const updated = await prisma.referee.update({
+      where: { id },
+      data: { images: ordered },
+      select: { id: true, images: true },
+    });
+    res.json(updated);
+  } catch (e) {
+    console.error('PATCH /referees/:id/images/reorder', e);
+    res.status(500).json({ error: 'Не удалось переупорядочить фото' });
+  }
+});
+
+/* =========================================================
+   ASSIGN / DETACH
+========================================================= */
 router.post('/:id(\\d+)/assign', async (req, res) => {
   try {
     const refereeId = Number(req.params.id);
     const matchId = toInt(req.body.matchId);
     const tMatchId = toInt(req.body.tournamentMatchId);
     const role = req.body.role ?? null;
-
     if (matchId == null && tMatchId == null) {
       return res
         .status(400)
         .json({ error: 'Нужно matchId или tournamentMatchId' });
     }
 
-    let result;
-    if (matchId != null) {
-      result = await prisma.matchReferee.upsert({
-        where: { matchId_refereeId: { matchId, refereeId } },
-        update: { role },
-        create: { matchId, refereeId, role },
-      });
-    } else {
-      result = await prisma.tournamentMatchReferee.upsert({
-        where: { matchId_refereeId: { matchId: tMatchId, refereeId } },
-        update: { role },
-        create: { matchId: tMatchId, refereeId, role },
-      });
-    }
+    const result =
+      matchId != null
+        ? await prisma.matchReferee.upsert({
+            where: { matchId_refereeId: { matchId, refereeId } },
+            update: { role },
+            create: { matchId, refereeId, role },
+          })
+        : await prisma.tournamentMatchReferee.upsert({
+            where: { matchId_refereeId: { matchId: tMatchId, refereeId } },
+            update: { role },
+            create: { matchId: tMatchId, refereeId, role },
+          });
+
     res.json(result);
   } catch (e) {
     console.error('POST /referees/:id/assign', e);
@@ -686,7 +699,6 @@ router.delete('/:id(\\d+)/assign', async (req, res) => {
     const refereeId = Number(req.params.id);
     const matchId = toInt(req.query.matchId);
     const tMatchId = toInt(req.query.tournamentMatchId);
-
     if (matchId == null && tMatchId == null) {
       return res
         .status(400)
@@ -710,9 +722,8 @@ router.delete('/:id(\\d+)/assign', async (req, res) => {
 });
 
 /* =========================================================
-   LEADERBOARD: топ судей по числу матчей (лига+турниры)
-   GET /referees/leaderboard/top?leagueId=&date_gte=&date_lte=&limit=20
-   ========================================================= */
+   LEADERBOARD
+========================================================= */
 router.get('/leaderboard/top', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 20)));
@@ -720,7 +731,6 @@ router.get('/leaderboard/top', async (req, res) => {
     const date_gte = toDate(req.query.date_gte);
     const date_lte = toDate(req.query.date_lte);
 
-    // считаем отдельно лига/турнир, затем склеиваем
     const leagueAgg = await prisma.matchReferee.groupBy({
       by: ['refereeId'],
       where: {
@@ -733,49 +743,44 @@ router.get('/leaderboard/top', async (req, res) => {
     });
     const tournAgg = await prisma.tournamentMatchReferee.groupBy({
       by: ['refereeId'],
-      where: {
-        match: {
-          date: { gte: date_gte, lte: date_lte },
-        },
-      },
+      where: { match: { date: { gte: date_gte, lte: date_lte } } },
       _count: { _all: true },
     });
 
     const map = new Map();
-    for (const r of leagueAgg) {
+    for (const r of leagueAgg)
       map.set(r.refereeId, { league: r._count._all, tournament: 0 });
-    }
     for (const r of tournAgg) {
-      const prev = map.get(r.refereeId) || { league: 0, tournament: 0 };
-      prev.tournament = r._count._all;
-      map.set(r.refereeId, prev);
+      map.set(r.refereeId, {
+        ...(map.get(r.refereeId) || { league: 0, tournament: 0 }),
+        tournament: r._count._all,
+      });
     }
 
-    const items = [...map.entries()].map(([id, cnt]) => ({
-      id,
-      league: cnt.league,
-      tournament: cnt.tournament,
-      total: cnt.league + cnt.tournament,
-    }));
-
-    items.sort((a, b) => b.total - a.total);
-    const top = items.slice(0, limit);
-    const ids = top.map((i) => i.id);
+    const items = [...map.entries()]
+      .map(([id, c]) => ({
+        id,
+        league: c.league,
+        tournament: c.tournament,
+        total: c.league + c.tournament,
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, limit);
 
     const refs = await prisma.referee.findMany({
-      where: { id: { in: ids } },
-      select: { id: true, name: true },
+      where: { id: { in: items.map((i) => i.id) } },
+      select: { id: true, name: true, images: true },
     });
     const refMap = new Map(refs.map((r) => [r.id, r]));
-
-    const out = top.map((i) => ({
-      id: i.id,
-      name: refMap.get(i.id)?.name || `#${i.id}`,
-      _count: { matchRefs: i.league, tournamentMatchRefs: i.tournament },
-      _totals: { league: i.league, tournament: i.tournament, total: i.total },
-    }));
-
-    res.json(out);
+    res.json(
+      items.map((i) => ({
+        id: i.id,
+        name: refMap.get(i.id)?.name || `#${i.id}`,
+        images: refMap.get(i.id)?.images || [],
+        _count: { matchRefs: i.league, tournamentMatchRefs: i.tournament },
+        _totals: { league: i.league, tournament: i.tournament, total: i.total },
+      }))
+    );
   } catch (e) {
     console.error('GET /referees/leaderboard/top', e);
     res.status(500).json({ error: 'Ошибка загрузки топа судей' });
@@ -783,10 +788,8 @@ router.get('/leaderboard/top', async (req, res) => {
 });
 
 /* =========================================================
-   BULK: create/delete
-   POST /referees/bulk  { names: ["A","B",...] }
-   DELETE /referees/bulk?ids=[1,2,3]
-   ========================================================= */
+   BULK
+========================================================= */
 router.post('/bulk', async (req, res) => {
   try {
     const names = Array.isArray(req.body?.names)
@@ -794,7 +797,7 @@ router.post('/bulk', async (req, res) => {
       : [];
     if (!names.length) return res.status(400).json({ error: 'Пустой список' });
     const data = names
-      .map((n) => ({ name: String(n).trim() }))
+      .map((n) => ({ name: String(n).trim(), images: [] }))
       .filter((n) => n.name.length);
     const result = await prisma.referee.createMany({
       data,

@@ -31,6 +31,7 @@ enum MatchStatus {
 
 enum EventType {
   GOAL
+  AUTOGOAL
   ASSIST
   YELLOW_CARD
   RED_CARD
@@ -187,6 +188,9 @@ model Player {
   LeagueTeamPlayer     LeagueTeamPlayer[]
   invites              TeamInvite[]           @relation("InvitedPlayer")
   TournamentTeamPlayer TournamentTeamPlayer[]
+
+  mvpOfTournamentMatches TournamentMatch[] @relation("TMatchMVP_Player")
+  TournamentMatch        TournamentMatch[]
 }
 
 /**
@@ -339,6 +343,8 @@ model Match {
   Photo          Photo[]
   Video          Video[]
 
+  commentators MatchCommentator[]
+
   @@index([leagueId, roundId])
   @@index([leagueId, team1Id, team2Id])
 }
@@ -410,6 +416,7 @@ model PlayerStat {
   yellow_cards  Int @default(0)
   red_cards     Int @default(0)
   matchesPlayed Int @default(0)
+  motm            Int        @default(0)
 
   playerId Int    @unique
   player   Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
@@ -446,11 +453,54 @@ model Referee {
   createdAt              DateTime                 @default(now()) @map("created_at")
   updatedAt              DateTime                 @updatedAt @map("updated_at")
   name                   String
+  images                 String[]                 @default([])
   matchRefs              MatchReferee[]
   TournamentMatchReferee TournamentMatchReferee[]
   MatchEvent             MatchEvent[]
   TournamentMatchEvent   TournamentMatchEvent[]
   TournamentGroup        TournamentGroup[]
+}
+
+model Commentator {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  name      String
+  images    String[] @default([])
+
+  matchLinks      MatchCommentator[]
+  tmatchLinks     TournamentMatchCommentator[]
+  TournamentGroup TournamentGroup[]
+}
+
+model MatchCommentator {
+  id            Int      @id @default(autoincrement())
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  matchId       Int
+  commentatorId Int
+  role          String? // MAIN, CO, REPORTER и т.п.
+
+  match       Match       @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  commentator Commentator @relation(fields: [commentatorId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, commentatorId])
+  @@index([matchId])
+}
+
+model TournamentMatchCommentator {
+  id            Int      @id @default(autoincrement())
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  matchId       Int
+  commentatorId Int
+  role          String?
+
+  match       TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  commentator Commentator     @relation(fields: [commentatorId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, commentatorId])
+  @@index([matchId])
 }
 
 model Stadium {
@@ -488,9 +538,9 @@ model News {
 
   tournamentId Int?
   tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
-  
-  matchId      Int?
-  match        Match?      @relation(fields: [matchId], references: [id], onDelete: SetNull)
+
+  matchId Int?
+  match   Match? @relation(fields: [matchId], references: [id], onDelete: SetNull)
 
   tMatchId Int?
   tMatch   TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
@@ -646,10 +696,12 @@ model TournamentTeamPlayer {
 
   captainOf TournamentTeam? @relation(name: "TournamentTeamCaptain")
 
-  matches              TournamentPlayerMatch[]
-  eventsMain           TournamentMatchEvent[]  @relation("TMainRosterItem")
-  eventsAssist         TournamentMatchEvent[]  @relation("TAssistRosterItem")
-  TournamentSuspension TournamentSuspension[]
+  matches                TournamentPlayerMatch[]
+  eventsMain             TournamentMatchEvent[]  @relation("TMainRosterItem")
+  eventsAssist           TournamentMatchEvent[]  @relation("TAssistRosterItem")
+  TournamentSuspension   TournamentSuspension[]
+  mvpOfTournamentMatches TournamentMatch[]       @relation("TMatchMVP")
+  TournamentMatch        TournamentMatch[]
 
   @@unique([tournamentTeamId, playerId])
   @@index([tournamentTeamId])
@@ -700,15 +752,17 @@ model TournamentTeamPlayer {
 // }
 
 model TournamentGroup {
-  id               Int                   @id @default(autoincrement())
-  tournamentId     Int
-  name             String?
-  type             GroupType             @default(ROUND1)
-  defaultRefereeId Int?
-  defaultReferee   Referee?              @relation(fields: [defaultRefereeId], references: [id], onDelete: SetNull)
-  matches          TournamentMatch[]
-  teams            TournamentGroupTeam[]
-  tournament       Tournament            @relation(fields: [tournamentId], references: [id])
+  id                   Int                   @id @default(autoincrement())
+  tournamentId         Int
+  name                 String?
+  type                 GroupType             @default(ROUND1)
+  defaultRefereeId     Int?
+  defaultReferee       Referee?              @relation(fields: [defaultRefereeId], references: [id], onDelete: SetNull)
+  matches              TournamentMatch[]
+  teams                TournamentGroupTeam[]
+  defaultCommentatorId Int?
+  defaultCommentator   Commentator?          @relation(fields: [defaultCommentatorId], references: [id], onDelete: SetNull)
+  tournament           Tournament            @relation(fields: [tournamentId], references: [id])
 }
 
 model TournamentGroupTeam {
@@ -752,8 +806,15 @@ model TournamentMatch {
   stadiumRel Stadium? @relation(fields: [stadiumId], references: [id], onDelete: SetNull)
 
   referees     TournamentMatchReferee[]
+  commentators TournamentMatchCommentator[]
   events       TournamentMatchEvent[]
   participants TournamentPlayerMatch[]
+
+  mvpRosterItemId Int?
+  mvpRosterItem   TournamentTeamPlayer? @relation(name: "TMatchMVP", fields: [mvpRosterItemId], references: [id], onDelete: SetNull)
+
+  mvpPlayerId Int?
+  mvpPlayer   Player? @relation(name: "TMatchMVP_Player", fields: [mvpPlayerId], references: [id], onDelete: SetNull)
 
   team1Formation String?
   team2Formation String?
@@ -769,7 +830,11 @@ model TournamentMatch {
   Video Video[]
   News  News[]
 
-  TournamentSuspension TournamentSuspension[]
+  TournamentSuspension   TournamentSuspension[]
+  Player                 Player?                @relation(fields: [playerId], references: [id])
+  playerId               Int?
+  TournamentTeamPlayer   TournamentTeamPlayer?  @relation(fields: [tournamentTeamPlayerId], references: [id])
+  tournamentTeamPlayerId Int?
 
   @@index([tournamentId, groupId])
   @@index([team1TTId, team2TTId])

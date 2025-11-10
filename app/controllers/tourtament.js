@@ -11,6 +11,57 @@ const prisma = new PrismaClient();
    HELPERS
 ========================================================= */
 
+async function assertRosterItemBelongsToMatch(matchId, rosterItemId) {
+  const it = await prisma.tournamentTeamPlayer.findUnique({
+    where: { id: Number(rosterItemId) },
+    select: { tournamentTeamId: true },
+  });
+  if (!it) throw new Error('Игрок-заявка не найдена');
+
+  const m = await prisma.tournamentMatch.findUnique({
+    where: { id: Number(matchId) },
+    select: { team1TTId: true, team2TTId: true },
+  });
+  if (!m) throw new Error('Матч не найден');
+
+  if (![m.team1TTId, m.team2TTId].includes(it.tournamentTeamId)) {
+    throw new Error('Игрок не участвует в этом матче');
+  }
+}
+
+async function incMotmByRoster(rosterItemId) {
+  const it = await prisma.tournamentTeamPlayer.findUnique({
+    where: { id: Number(rosterItemId) },
+    select: { playerId: true },
+  });
+  if (!it?.playerId) return;
+  await prisma.playerStat.upsert({
+    where: { playerId: it.playerId },
+    update: { motm: { increment: 1 } },
+    create: {
+      playerId: it.playerId,
+      matchesPlayed: 0,
+      goals: 0,
+      assists: 0,
+      yellow_cards: 0,
+      red_cards: 0,
+      motm: 1,
+    },
+  });
+}
+
+async function decMotmByRoster(rosterItemId) {
+  const it = await prisma.tournamentTeamPlayer.findUnique({
+    where: { id: Number(rosterItemId) },
+    select: { playerId: true },
+  });
+  if (!it?.playerId) return;
+  await prisma.playerStat.updateMany({
+    where: { playerId: it.playerId, motm: { gt: 0 } },
+    data: { motm: { decrement: 1 } },
+  });
+}
+
 const FIN = 'FINISHED';
 const isFinished = (s) => String(s).toUpperCase() === String(FIN).toUpperCase();
 
@@ -50,6 +101,8 @@ const toBool = (v, d = false) => {
 };
 
 const isGoalType = (t) => t === 'GOAL' || t === 'PENALTY_SCORED';
+const isScoreEvent = (t) =>
+  t === 'GOAL' || t === 'PENALTY_SCORED' || t === 'AUTOGOAL';
 
 const STARTERS_BY_FORMAT = {
   F5x5: 5,
@@ -201,6 +254,7 @@ const buildTournamentInclude = (p) => {
       include: {
         teams: { include: { tournamentTeam: { include: { team: true } } } },
         defaultReferee: true,
+        defaultCommentator: true,
       },
     };
   }
@@ -220,6 +274,8 @@ const buildTMatchInclude = (p) => {
   if (parts.includes('team2')) inc.team2TT = { include: { team: true } };
   if (parts.includes('stadium')) inc.stadiumRel = true;
   if (parts.includes('referees')) inc.referees = { include: { referee: true } };
+  if (parts.includes('commentators'))
+    inc.commentators = { include: { commentator: true } };
   if (parts.includes('events')) {
     inc.events = {
       include: {
@@ -233,6 +289,9 @@ const buildTMatchInclude = (p) => {
     inc.participants = {
       include: { tournamentTeamPlayer: { include: { player: true } } },
     };
+  }
+  if (parts.includes('mvp')) {
+    inc.mvpRosterItem = { include: { player: true } };
   }
   return inc;
 };
@@ -266,6 +325,20 @@ function normalizeMatch(m) {
   const referee = mainRel?.referee || null;
   const refereeId = referee?.id ?? null;
   const refereeName = referee?.name ?? null;
+  const mvpRosterItemId = m.mvpRosterItemId ?? null;
+  let mvp = null;
+  if (mvpRosterItemId && m.mvpRosterItem) {
+    const p = m.mvpRosterItem.player || {};
+    mvp = {
+      rosterItemId: mvpRosterItemId,
+      playerId: m.mvpRosterItem.playerId ?? null,
+      name: p.name || '',
+      number: m.mvpRosterItem.number ?? p.number ?? null,
+      position: m.mvpRosterItem.position ?? p.position ?? null,
+      photos: Array.isArray(p.images) ? p.images : [],
+      ttId: m.mvpRosterItem.tournamentTeamId ?? null,
+    };
+  }
   return {
     ...m,
     stadium,
@@ -273,6 +346,8 @@ function normalizeMatch(m) {
     referee,
     refereeId,
     refereeName,
+    mvpRosterItemId,
+    mvp,
   };
 }
 
@@ -325,7 +400,7 @@ async function recomputeTMatchScore(matchId) {
   await prisma.$transaction(async (tx) => {
     const grouped = await tx.tournamentMatchEvent.groupBy({
       by: ['tournamentTeamId'],
-      where: { matchId, type: { in: ['GOAL', 'PENALTY_SCORED'] } },
+      where: { matchId, type: { in: ['GOAL', 'PENALTY_SCORED', 'AUTOGOAL'] } },
       _count: { _all: true },
     });
     const m = await tx.tournamentMatch.findUnique({
@@ -1323,6 +1398,264 @@ router.put('/tournament-groups/:groupId(\\d+)/referee', async (req, res) => {
   }
 });
 
+// 🔧 2) ГРУППЫ: defaultCommentator (как defaultReferee)
+
+router.put(
+  '/tournament-groups/:groupId(\\d+)/commentator',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const commentatorId = toInt(req.body?.commentatorId, null);
+      const apply = String(req.query.apply || 'false') === 'true';
+
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: commentatorId },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+
+      if (apply && commentatorId) {
+        const ids = await prisma.tournamentMatch
+          .findMany({ where: { groupId }, select: { id: true } })
+          .then((r) => r.map((x) => x.id));
+
+        if (ids.length) {
+          await prisma.tournamentMatchCommentator.createMany({
+            data: ids.map((id) => ({
+              matchId: id,
+              commentatorId,
+              role: 'MAIN',
+            })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      res.json(g);
+    } catch (e) {
+      console.error('PUT /tournament-groups/:groupId/commentator', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось сохранить комментатора группы' });
+    }
+  }
+);
+
+router.post('/tournament-groups/:groupId(\\d+)/commentator', (req, res) => {
+  req.method = 'PUT';
+  router.handle(req, res);
+});
+
+router.post(
+  '/tournament-groups/:groupId(\\d+)/commentator/apply',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const g = await prisma.tournamentGroup.findUnique({
+        where: { id: groupId },
+        select: { defaultCommentatorId: true, tournamentId: true },
+      });
+      if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+      if (!g.defaultCommentatorId) {
+        return res
+          .status(400)
+          .json({ error: 'В группе не выбран комментатор' });
+      }
+
+      const ids = await prisma.tournamentMatch
+        .findMany({ where: { groupId }, select: { id: true } })
+        .then((r) => r.map((x) => x.id));
+
+      if (ids.length) {
+        await prisma.tournamentMatchCommentator.createMany({
+          data: ids.map((id) => ({
+            matchId: id,
+            commentatorId: g.defaultCommentatorId,
+            role: 'MAIN',
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      res.json({ success: true, affectedMatches: ids.length });
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/commentator/apply', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось применить комментатора для группы' });
+    }
+  }
+);
+
+// совместимые короткие маршруты (как у судьи)
+router.post(
+  '/tournament-groups/:groupId(\\d+)/commentator/:commId(\\d+)',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const commId = Number(req.params.commId);
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: commId },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+      res.json(g);
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/commentator/:commId', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось назначить комментатора группе' });
+    }
+  }
+);
+
+router.delete(
+  '/tournament-groups/:groupId(\\d+)/commentator',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: null },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+      res.json(g);
+    } catch (e) {
+      console.error('DELETE /tournament-groups/:groupId/commentator', e);
+      res.status(400).json({ error: 'Не удалось снять комментатора с группы' });
+    }
+  }
+);
+
+// 🔧 2) ГРУППЫ: defaultCommentator (как defaultReferee)
+
+router.put(
+  '/tournament-groups/:groupId(\\d+)/commentator',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const commentatorId = toInt(req.body?.commentatorId, null);
+      const apply = String(req.query.apply || 'false') === 'true';
+
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: commentatorId },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+
+      if (apply && commentatorId) {
+        const ids = await prisma.tournamentMatch
+          .findMany({ where: { groupId }, select: { id: true } })
+          .then((r) => r.map((x) => x.id));
+
+        if (ids.length) {
+          await prisma.tournamentMatchCommentator.createMany({
+            data: ids.map((id) => ({
+              matchId: id,
+              commentatorId,
+              role: 'MAIN',
+            })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      res.json(g);
+    } catch (e) {
+      console.error('PUT /tournament-groups/:groupId/commentator', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось сохранить комментатора группы' });
+    }
+  }
+);
+
+router.post('/tournament-groups/:groupId(\\d+)/commentator', (req, res) => {
+  req.method = 'PUT';
+  router.handle(req, res);
+});
+
+router.post(
+  '/tournament-groups/:groupId(\\d+)/commentator/apply',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const g = await prisma.tournamentGroup.findUnique({
+        where: { id: groupId },
+        select: { defaultCommentatorId: true, tournamentId: true },
+      });
+      if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+      if (!g.defaultCommentatorId) {
+        return res
+          .status(400)
+          .json({ error: 'В группе не выбран комментатор' });
+      }
+
+      const ids = await prisma.tournamentMatch
+        .findMany({ where: { groupId }, select: { id: true } })
+        .then((r) => r.map((x) => x.id));
+
+      if (ids.length) {
+        await prisma.tournamentMatchCommentator.createMany({
+          data: ids.map((id) => ({
+            matchId: id,
+            commentatorId: g.defaultCommentatorId,
+            role: 'MAIN',
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      res.json({ success: true, affectedMatches: ids.length });
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/commentator/apply', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось применить комментатора для группы' });
+    }
+  }
+);
+
+// совместимые короткие маршруты (как у судьи)
+router.post(
+  '/tournament-groups/:groupId(\\d+)/commentator/:commId(\\d+)',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const commId = Number(req.params.commId);
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: commId },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+      res.json(g);
+    } catch (e) {
+      console.error('POST /tournament-groups/:groupId/commentator/:commId', e);
+      res
+        .status(400)
+        .json({ error: 'Не удалось назначить комментатора группе' });
+    }
+  }
+);
+
+router.delete(
+  '/tournament-groups/:groupId(\\d+)/commentator',
+  async (req, res) => {
+    try {
+      const groupId = Number(req.params.groupId);
+      const g = await prisma.tournamentGroup.update({
+        where: { id: groupId },
+        data: { defaultCommentatorId: null },
+        select: { id: true, tournamentId: true, defaultCommentatorId: true },
+      });
+      res.json(g);
+    } catch (e) {
+      console.error('DELETE /tournament-groups/:groupId/commentator', e);
+      res.status(400).json({ error: 'Не удалось снять комментатора с группы' });
+    }
+  }
+);
+
 router.post('/tournament-groups/:groupId(\\d+)/referee', (req, res) => {
   req.method = 'PUT';
   router.handle(req, res);
@@ -1663,7 +1996,7 @@ router.get('/tournaments/:id(\\d+)/matches', async (req, res) => {
     const sortOrder =
       String(sort[1] || 'ASC').toLowerCase() === 'desc' ? 'desc' : 'asc';
     const include = buildTMatchInclude(
-      req.query.include || 'team1,team2,stadium,referees'
+      req.query.include || 'team1,team2,stadium,referees,commentators,mvp' // 👈 добавили mvp по умолчанию
     );
 
     const AND = [{ tournamentId }];
@@ -1706,7 +2039,8 @@ router.get('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
     const include = buildTMatchInclude(
-      req.query.include || 'team1,team2,stadium,referees,events,group'
+      req.query.include ||
+        'team1,team2,stadium,referees,commentators,events,group,mvp' // 👈 mvp
     );
     const item = await prisma.tournamentMatch.findUnique({
       where: { id },
@@ -1801,7 +2135,9 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
 
     const created = await prisma.tournamentMatch.create({
       data,
-      include: buildTMatchInclude('team1,team2,stadium,referees,group'),
+      include: buildTMatchInclude(
+        'team1,team2,stadium,referees, commentators,group,mvp'
+      ),
     });
 
     if (created.groupId) {
@@ -1845,7 +2181,7 @@ router.post('/tournaments/:id(\\d+)/matches', async (req, res) => {
   }
 });
 
-// patch (с обработкой FINISHED)
+// patch (с обработкой FINISHED и MVP motm++)
 router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.matchId);
@@ -1858,6 +2194,7 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
         team1TTId: true,
         team2TTId: true,
         status: true,
+        mvpRosterItemId: true, // 👈 берём старый MVP
       },
     });
     if (!old) return res.status(404).json({ error: 'Матч не найден' });
@@ -1877,6 +2214,7 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
       'team1Score',
       'team2Score',
       'tour',
+      'mvpRosterItemId',
     ];
     for (const k of keys) {
       if (!(k in req.body)) continue;
@@ -1922,12 +2260,33 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
         return res.status(400).json({ error: 'Группа не из турнира матча' });
     }
 
+    // валидируем MVP, если задают
+    const prevMvpId = old.mvpRosterItemId ?? null;
+    if ('mvpRosterItemId' in req.body && patch.mvpRosterItemId != null) {
+      await assertRosterItemBelongsToMatch(id, patch.mvpRosterItemId);
+    }
+
+    // сразу после вычисления prevMvpId и перед update(...)
+    if ('mvpRosterItemId' in req.body) {
+      if (patch.mvpRosterItemId != null) {
+        await assertRosterItemBelongsToMatch(id, patch.mvpRosterItemId);
+        const it = await prisma.tournamentTeamPlayer.findUnique({
+          where: { id: patch.mvpRosterItemId },
+          select: { playerId: true },
+        });
+        patch.mvpPlayerId = it?.playerId ?? null;
+      } else {
+        patch.mvpPlayerId = null;
+      }
+    }
+
     const upd = await prisma.tournamentMatch.update({
       where: { id },
       data: patch,
-      include: buildTMatchInclude('team1,team2,stadium,referees,group'),
+      include: buildTMatchInclude('team1,team2,stadium,referees,group,mvp'),
     });
 
+    // если сменился groupId — подтянем дефолтного главного судью, если нужно
     if (patch.groupId !== undefined) {
       const newGroupId = upd.groupId;
       if (newGroupId) {
@@ -1954,6 +2313,13 @@ router.patch('/tournament-matches/:matchId(\\d+)', async (req, res) => {
           }
         }
       }
+    }
+
+    // --- MVP motm инк/дек ---
+    if ('mvpRosterItemId' in req.body) {
+      const newMvpId = upd.mvpRosterItemId ?? null;
+      if (prevMvpId && prevMvpId !== newMvpId) await decMotmByRoster(prevMvpId);
+      if (newMvpId && newMvpId !== prevMvpId) await incMotmByRoster(newMvpId);
     }
 
     if (!isFinished(old.status) && isFinished(upd.status)) {
@@ -2105,6 +2471,109 @@ router.post('/tournament-matches/:matchId(\\d+)/score', async (req, res) => {
   }
 });
 
+/* ===== MVP convenient endpoints ===== */
+
+// назначить MVP: { rosterItemId? , playerId? }
+router.post('/tournament-matches/:matchId(\\d+)/mvp', async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const rosterItemIdRaw = toInt(req.body?.rosterItemId, null);
+    const playerId = toInt(req.body?.playerId, null);
+
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: matchId },
+      select: {
+        id: true,
+        tournamentId: true,
+        team1TTId: true,
+        team2TTId: true,
+        mvpRosterItemId: true,
+      },
+    });
+    if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+    let rosterItemId = rosterItemIdRaw;
+
+    if (!rosterItemId && playerId) {
+      const it = await prisma.tournamentTeamPlayer.findFirst({
+        where: {
+          playerId,
+          tournamentTeamId: { in: [m.team1TTId, m.team2TTId] },
+        },
+        select: { id: true },
+      });
+      if (!it)
+        return res.status(400).json({ error: 'Игрок не из команд матча' });
+      rosterItemId = it.id;
+    }
+
+    if (!rosterItemId) {
+      return res.status(400).json({ error: 'Нужен rosterItemId или playerId' });
+    }
+
+    await assertRosterItemBelongsToMatch(matchId, rosterItemId);
+
+    const roster = await prisma.tournamentTeamPlayer.findUnique({
+      where: { id: rosterItemId },
+      select: { playerId: true },
+    });
+
+    const upd = await prisma.tournamentMatch.update({
+      where: { id: matchId },
+      data: {
+        mvpRosterItemId: rosterItemId,
+        mvpPlayerId: roster?.playerId ?? null,
+      },
+      include: buildTMatchInclude('team1,team2,stadium,referees,mvp'),
+    });
+
+    // motm++
+    const prevId = m.mvpRosterItemId ?? null;
+    if (prevId && prevId !== rosterItemId) await decMotmByRoster(prevId);
+    if (rosterItemId && rosterItemId !== prevId)
+      await incMotmByRoster(rosterItemId);
+
+    const io = getIO();
+    io.to(`tmatch:${matchId}`).emit('tmatch:update', upd);
+    io.to(`tournament:${upd.tournamentId}`).emit('tmatch:update', upd);
+
+    res.json(normalizeMatch(upd));
+  } catch (e) {
+    console.error('POST /tournament-matches/:matchId/mvp', e);
+    res.status(400).json({ error: e?.message || 'Не удалось назначить MVP' });
+  }
+});
+
+// снять MVP
+router.delete('/tournament-matches/:matchId(\\d+)/mvp', async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const m = await prisma.tournamentMatch.findUnique({
+      where: { id: matchId },
+      select: { tournamentId: true, mvpRosterItemId: true },
+    });
+    if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+    const upd = await prisma.tournamentMatch.update({
+      where: { id: matchId },
+      data: { mvpRosterItemId: null, mvpPlayerId: null },
+      include: buildTMatchInclude('team1,team2,stadium,referees,mvp'),
+    });
+
+    if (m.mvpRosterItemId) await decMotmByRoster(m.mvpRosterItemId);
+
+    const io = getIO();
+    io.to(`tmatch:${matchId}`).emit('tmatch:update', upd);
+    io.to(`tournament:${upd.tournamentId}`).emit('tmatch:update', upd);
+
+    res.json(normalizeMatch(upd));
+  } catch (e) {
+    console.error('DELETE /tournament-matches/:matchId/mvp', e);
+    res.status(400).json({ error: 'Не удалось снять MVP' });
+  }
+});
+
+/* maintenance */
 router.post('/maintenance/recalc/team-totals', async (req, res) => {
   try {
     const teamIds = await prisma.team
@@ -2475,12 +2944,10 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
 
     if (created.rosterItemId)
       await incPlayerStatByRoster(created.rosterItemId, created.type);
-    if (created.type === 'ASSIST' && created.rosterItemId)
-      await incPlayerStatByRoster(created.rosterItemId, 'ASSIST');
     if (created.assistRosterItemId && created.type === 'GOAL')
       await incPlayerStatByRoster(created.assistRosterItemId, 'ASSIST');
 
-    if (isGoalType(created.type)) await recomputeTMatchScore(matchId);
+    if (isScoreEvent(created.type)) await recomputeTMatchScore(matchId);
     await maybeCreateSuspensionAfterEvent(created);
     await recalcTotalsIfFinished(matchId);
 
@@ -2691,12 +3158,10 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
 
     if (updated.rosterItemId)
       await incPlayerStatByRoster(updated.rosterItemId, updated.type);
-    if (updated.type === 'ASSIST' && updated.rosterItemId)
-      await incPlayerStatByRoster(updated.rosterItemId, 'ASSIST');
     if (updated.assistRosterItemId && updated.type === 'GOAL')
       await incPlayerStatByRoster(updated.assistRosterItemId, 'ASSIST');
 
-    if (isGoalType(updated.type) || isGoalType(old.type))
+    if (isScoreEvent(updated.type) || isScoreEvent(old.type))
       await recomputeTMatchScore(updated.matchId);
 
     await recalcTotalsIfFinished(updated.matchId);
@@ -2742,12 +3207,10 @@ router.delete('/tournament-events/:eventId(\\d+)', async (req, res) => {
 
     if (old.rosterItemId)
       await decPlayerStatByRoster(old.rosterItemId, old.type);
-    if (old.type === 'ASSIST' && old.rosterItemId)
-      await decPlayerStatByRoster(old.rosterItemId, 'ASSIST');
     if (old.assistRosterItemId && old.type === 'GOAL')
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
 
-    if (isGoalType(old.type)) await recomputeTMatchScore(old.matchId);
+    if (isScoreEvent(old.type)) await recomputeTMatchScore(old.matchId);
     await recalcTotalsIfFinished(old.matchId);
 
     const m = await prisma.tournamentMatch.findUnique({
@@ -2953,7 +3416,7 @@ router.get('/tournament-groups/:groupId(\\d+)/matches', async (req, res) => {
     const rows = await prisma.tournamentMatch.findMany({
       where: { groupId },
       orderBy: [{ date: 'asc' }, { id: 'asc' }],
-      include: buildTMatchInclude('team1,team2,stadium,referees,group'),
+      include: buildTMatchInclude('team1,team2,stadium,referees,group,mvp'),
     });
 
     const normalized = rows.map((m) => {
@@ -3094,6 +3557,147 @@ router.get('/tournament-groups/:groupId(\\d+)/standings', async (req, res) => {
     res.status(500).json({ error: 'Ошибка расчёта таблицы группы' });
   }
 });
+
+// 🔧 3) МАТЧИ: комментаторы (как судьи)
+
+router.get(
+  '/tournament-matches/:matchId(\\d+)/commentators',
+  async (req, res) => {
+    try {
+      const id = Number(req.params.matchId);
+      const rows = await prisma.tournamentMatchCommentator.findMany({
+        where: { matchId: id },
+        include: { commentator: true },
+        orderBy: { commentatorId: 'asc' },
+      });
+      res.json(rows);
+    } catch (e) {
+      console.error('GET /tournament-matches/:id/commentators', e);
+      res.status(500).json({ error: 'Ошибка загрузки комментаторов' });
+    }
+  }
+);
+
+router.post(
+  '/tournament-matches/:matchId(\\d+)/commentators',
+  async (req, res) => {
+    try {
+      const id = Number(req.params.matchId);
+      const list = Array.isArray(req.body)
+        ? req.body
+        : Array.isArray(req.body?.items)
+          ? req.body.items
+          : [];
+      await prisma.$transaction(async (tx) => {
+        await tx.tournamentMatchCommentator.deleteMany({
+          where: { matchId: id },
+        });
+        if (list.length) {
+          await tx.tournamentMatchCommentator.createMany({
+            data: list.map((r) => ({
+              matchId: id,
+              commentatorId: Number(r.commentatorId),
+              role: r.role ?? null,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      });
+      const rows = await prisma.tournamentMatchCommentator.findMany({
+        where: { matchId: id },
+        include: { commentator: true },
+      });
+
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${id}`).emit('tcommentators:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('tcommentators:updated', {
+          matchId: id,
+        });
+      }
+      res.json(rows);
+    } catch (e) {
+      console.error('POST /tournament-matches/:id/commentators', e);
+      res.status(400).json({ error: 'Не удалось сохранить комментаторов' });
+    }
+  }
+);
+
+router.post(
+  '/tournament-matches/:matchId(\\d+)/commentators/assign',
+  async (req, res) => {
+    try {
+      const matchId = Number(req.params.matchId);
+      const commentatorId = toInt(req.body.commentatorId);
+      const role = req.body.role ?? null;
+      if (!commentatorId)
+        return res.status(400).json({ error: 'commentatorId обязателен' });
+
+      const row = await prisma.tournamentMatchCommentator.upsert({
+        where: { matchId_commentatorId: { matchId, commentatorId } },
+        update: { role },
+        create: { matchId, commentatorId, role },
+      });
+
+      const rows = await prisma.tournamentMatchCommentator.findMany({
+        where: { matchId },
+        include: { commentator: true },
+      });
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id: matchId },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${matchId}`).emit('tcommentators:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('tcommentators:updated', {
+          matchId,
+        });
+      }
+      res.json(row);
+    } catch (e) {
+      console.error('POST /tournament-matches/:id/commentators/assign', e);
+      res.status(400).json({ error: 'Не удалось назначить комментатора' });
+    }
+  }
+);
+
+router.delete(
+  '/tournament-matches/:matchId(\\d+)/commentators/:commId(\\d+)',
+  async (req, res) => {
+    try {
+      const matchId = Number(req.params.matchId);
+      const commentatorId = Number(req.params.commId);
+      await prisma.tournamentMatchCommentator.delete({
+        where: { matchId_commentatorId: { matchId, commentatorId } },
+      });
+
+      const rows = await prisma.tournamentMatchCommentator.findMany({
+        where: { matchId },
+        include: { commentator: true },
+      });
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id: matchId },
+        select: { tournamentId: true },
+      });
+      if (m) {
+        const io = getIO();
+        io.to(`tmatch:${matchId}`).emit('tcommentators:updated', rows);
+        io.to(`tournament:${m.tournamentId}`).emit('tcommentators:updated', {
+          matchId,
+        });
+      }
+      res.json({ success: true });
+    } catch (e) {
+      console.error('DELETE /tournament-matches/:id/commentators/:commId', e);
+      res.status(400).json({ error: 'Не удалось снять комментатора' });
+    }
+  }
+);
 
 // Глобальный пересчёт matchesPlayed из заявок (по всем/по одному игроку)
 router.post('/player-stats/recompute', async (req, res) => {

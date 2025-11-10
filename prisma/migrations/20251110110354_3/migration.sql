@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "PlayerStat" ADD COLUMN     "motm" INTEGER NOT NULL DEFAULT 0;
