@@ -29,17 +29,31 @@ const toStrArr = (val) => {
     .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
     .filter(Boolean);
 };
+
+const uniqInts = (arr) =>
+  Array.from(
+    new Set((arr || []).map((x) => Number(x)).filter(Number.isFinite))
+  );
+
+const parseTeamIds = (val) => {
+  if (val == null) return [];
+  if (Array.isArray(val)) return uniqInts(val);
+  if (typeof val === 'string') return uniqInts(val.split(/[,\s;]+/));
+  return uniqInts([val]);
+};
+
 const buildIncludeFlags = (p) => {
   const parts = String(p || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
+  const has = (k) => parts.includes(k) || parts.includes(`${k}`.toLowerCase());
   return {
-    league: parts.includes('league'),
-    match: parts.includes('match'),
-    tmatch: parts.includes('tmatch') || parts.includes('tournamentmatch'),
-    tournament: parts.includes('tournament'),
-    team: parts.includes('team'),
+    league: has('league'),
+    match: has('match'),
+    tmatch: has('tmatch') || has('tournamentmatch'),
+    tournament: has('tournament'),
+    teams: has('teams') || has('team'),
   };
 };
 const makeInclude = (flags) => {
@@ -48,7 +62,16 @@ const makeInclude = (flags) => {
   if (flags?.match) inc.match = true;
   if (flags?.tmatch) inc.tMatch = true;
   if (flags?.tournament) inc.tournament = true;
-  if (flags?.team) inc.team = true;
+  if (flags?.teams) {
+    inc.teams = {
+      select: {
+        id: true,
+        title: true,
+        smallTitle: true,
+        logo: true,
+      },
+    };
+  }
   return inc;
 };
 
@@ -122,9 +145,29 @@ router.get('/', async (req, res) => {
     ) {
       AND.push({ tournamentId: Number(filter.tournamentId) });
     }
-    if (filter.teamId != null && Number.isFinite(Number(filter.teamId))) {
-      AND.push({ teamId: Number(filter.teamId) });
+
+    // --- teams filter (M:N) + legacy ---
+    const fTeamId =
+      filter.teamId != null && Number.isFinite(Number(filter.teamId))
+        ? Number(filter.teamId)
+        : null;
+    const fTeamIds = Array.isArray(filter.teamIds)
+      ? uniqInts(filter.teamIds)
+      : [];
+
+    if (fTeamId || fTeamIds.length) {
+      const ors = [];
+      if (fTeamId) {
+        ors.push({ teams: { some: { id: fTeamId } } });
+        ors.push({ teamId: fTeamId }); // legacy
+      }
+      if (fTeamIds.length) {
+        ors.push({ teams: { some: { id: { in: fTeamIds } } } });
+        ors.push({ teamId: { in: fTeamIds } }); // legacy
+      }
+      AND.push({ OR: ors });
     }
+
     if (filter.hasImages === true || String(filter.hasImages) === 'true') {
       AND.push({ images: { isEmpty: false } });
     }
@@ -222,7 +265,12 @@ router.get('/by-team/:teamId(\\d+)', async (req, res) => {
   try {
     const teamId = Number(req.params.teamId);
     const rows = await prisma.photo.findMany({
-      where: { teamId },
+      where: {
+        OR: [
+          { teams: { some: { id: teamId } } }, // M:N
+          { teamId }, // legacy
+        ],
+      },
       orderBy: { date: 'desc' },
     });
     res.json(rows);
@@ -262,7 +310,8 @@ router.post('/', async (req, res) => {
       tournamentId,
       tMatchId,
       tournamentMatchId,
-      teamId,
+      teamId, // legacy
+      teamIds, // NEW
     } = req.body;
 
     const _matchId = toInt(matchId, null);
@@ -270,24 +319,28 @@ router.post('/', async (req, res) => {
     let _leagueId = toInt(leagueId, null);
     let _tournamentId = toInt(tournamentId, null);
     const _teamId = toInt(teamId, null);
+    const _teamIds = parseTeamIds(teamIds);
 
     if (_matchId && _leagueId == null)
       _leagueId = await deriveLeagueIdFromMatchId(_matchId);
     if (_tMatchId && _tournamentId == null)
       _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
-    const created = await prisma.photo.create({
-      data: {
-        title: title ?? null,
-        date: toDate(date, new Date()),
-        images: toStrArr([...images, ...imagesRaw]),
-        leagueId: _leagueId ?? null,
-        matchId: _matchId ?? null,
-        tMatchId: _tMatchId ?? null,
-        tournamentId: _tournamentId ?? null,
-        teamId: _teamId ?? null,
-      },
-    });
+    const data = {
+      title: title ?? null,
+      date: toDate(date, new Date()),
+      images: toStrArr([...images, ...imagesRaw]),
+      leagueId: _leagueId ?? null,
+      matchId: _matchId ?? null,
+      tMatchId: _tMatchId ?? null,
+      tournamentId: _tournamentId ?? null,
+      teamId: _teamId ?? null, // legacy
+    };
+    if (_teamIds.length) {
+      data.teams = { connect: _teamIds.map((id) => ({ id })) };
+    }
+
+    const created = await prisma.photo.create({ data });
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /images', e);
@@ -309,7 +362,10 @@ router.patch('/:id(\\d+)', async (req, res) => {
       tournamentId,
       tMatchId,
       tournamentMatchId,
-      teamId,
+      teamId, // legacy
+      teamIds, // NEW replace
+      teamIdsConnect, // NEW add
+      teamIdsDisconnect, // NEW remove
     } = req.body;
 
     const patch = {};
@@ -321,28 +377,20 @@ router.patch('/:id(\\d+)', async (req, res) => {
 
     let _matchId;
     let _tMatchId;
-    let _leagueId;
-    let _tournamentId;
 
-    if (leagueId !== undefined) {
-      _leagueId = toInt(leagueId, null);
-      patch.leagueId = _leagueId;
-    }
+    if (leagueId !== undefined) patch.leagueId = toInt(leagueId, null);
     if (matchId !== undefined) {
       _matchId = toInt(matchId, null);
       patch.matchId = _matchId;
     }
-    if (tournamentId !== undefined) {
-      _tournamentId = toInt(tournamentId, null);
-      patch.tournamentId = _tournamentId;
-    }
+    if (tournamentId !== undefined)
+      patch.tournamentId = toInt(tournamentId, null);
     if (tMatchId !== undefined || tournamentMatchId !== undefined) {
       _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
       patch.tMatchId = _tMatchId;
     }
-    if (teamId !== undefined) {
-      patch.teamId = toInt(teamId, null);
-    }
+
+    if (teamId !== undefined) patch.teamId = toInt(teamId, null); // legacy
 
     if (_matchId != null && leagueId === undefined) {
       const derived = await deriveLeagueIdFromMatchId(_matchId);
@@ -351,6 +399,19 @@ router.patch('/:id(\\d+)', async (req, res) => {
     if (_tMatchId != null && tournamentId === undefined) {
       const derived = await deriveTournamentIdFromTMatchId(_tMatchId);
       if (derived != null) patch.tournamentId = derived;
+    }
+
+    // M:N
+    const replaceIds = parseTeamIds(teamIds);
+    const addIds = parseTeamIds(teamIdsConnect);
+    const removeIds = parseTeamIds(teamIdsDisconnect);
+    if (replaceIds.length) {
+      patch.teams = { set: replaceIds.map((id) => ({ id })) };
+    } else if (addIds.length || removeIds.length) {
+      patch.teams = {};
+      if (addIds.length) patch.teams.connect = addIds.map((id) => ({ id }));
+      if (removeIds.length)
+        patch.teams.disconnect = removeIds.map((id) => ({ id }));
     }
 
     const updated = await prisma.photo.update({ where: { id }, data: patch });
@@ -375,7 +436,8 @@ router.put('/:id(\\d+)', async (req, res) => {
       tournamentId,
       tMatchId,
       tournamentMatchId,
-      teamId,
+      teamId, // legacy
+      teamIds, // NEW replace
     } = req.body;
 
     const _matchId = toInt(matchId, null);
@@ -383,25 +445,28 @@ router.put('/:id(\\d+)', async (req, res) => {
     let _leagueId = toInt(leagueId, null);
     let _tournamentId = toInt(tournamentId, null);
     const _teamId = toInt(teamId, null);
+    const _teamIds = parseTeamIds(teamIds);
 
     if (_matchId && _leagueId == null)
       _leagueId = await deriveLeagueIdFromMatchId(_matchId);
     if (_tMatchId && _tournamentId == null)
       _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
-    const updated = await prisma.photo.update({
-      where: { id },
-      data: {
-        title: title ?? null,
-        date: toDate(date),
-        images: toStrArr([...images, ...imagesRaw]),
-        leagueId: _leagueId ?? null,
-        matchId: _matchId ?? null,
-        tMatchId: _tMatchId ?? null,
-        tournamentId: _tournamentId ?? null,
-        teamId: _teamId ?? null,
-      },
-    });
+    const data = {
+      title: title ?? null,
+      date: toDate(date),
+      images: toStrArr([...images, ...imagesRaw]),
+      leagueId: _leagueId ?? null,
+      matchId: _matchId ?? null,
+      tMatchId: _tMatchId ?? null,
+      tournamentId: _tournamentId ?? null,
+      teamId: _teamId ?? null, // legacy
+    };
+    if (_teamIds.length) {
+      data.teams = { set: _teamIds.map((id) => ({ id })) };
+    }
+
+    const updated = await prisma.photo.update({ where: { id }, data });
     res.json(updated);
   } catch (e) {
     console.error('PUT /images/:id', e);
@@ -419,8 +484,12 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
       tournamentId,
       tMatchId,
       tournamentMatchId,
-      teamId,
+      teamId, // legacy
+      teamIdsConnect, // NEW
     } = req.body || {};
+
+    const addIds = parseTeamIds(teamIdsConnect);
+
     const data = {
       leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
       matchId: matchId !== undefined ? toInt(matchId, null) : undefined,
@@ -430,7 +499,7 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
           : undefined,
       tournamentId:
         tournamentId !== undefined ? toInt(tournamentId, null) : undefined,
-      teamId: teamId !== undefined ? toInt(teamId, null) : undefined,
+      teamId: teamId !== undefined ? toInt(teamId, null) : undefined, // legacy
     };
 
     if (data.matchId != null && leagueId === undefined) {
@@ -440,6 +509,9 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
     if (data.tMatchId != null && tournamentId === undefined) {
       const derived = await deriveTournamentIdFromTMatchId(data.tMatchId);
       if (derived != null) data.tournamentId = derived;
+    }
+    if (addIds.length) {
+      data.teams = { connect: addIds.map((id) => ({ id })) };
     }
 
     const updated = await prisma.photo.update({ where: { id }, data });
@@ -457,18 +529,23 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
       match = false,
       tmatch = false,
       tournament = false,
-      team = false,
+      team = false, // legacy
+      teamIdsDisconnect, // NEW
     } = req.body || {};
-    const updated = await prisma.photo.update({
-      where: { id },
-      data: {
-        leagueId: league ? null : undefined,
-        matchId: match ? null : undefined,
-        tMatchId: tmatch ? null : undefined,
-        tournamentId: tournament ? null : undefined,
-        teamId: team ? null : undefined,
-      },
-    });
+    const removeIds = parseTeamIds(teamIdsDisconnect);
+
+    const data = {
+      leagueId: league ? null : undefined,
+      matchId: match ? null : undefined,
+      tMatchId: tmatch ? null : undefined,
+      tournamentId: tournament ? null : undefined,
+      teamId: team ? null : undefined, // legacy
+    };
+    if (removeIds.length) {
+      data.teams = { disconnect: removeIds.map((id) => ({ id })) };
+    }
+
+    const updated = await prisma.photo.update({ where: { id }, data });
     res.json(updated);
   } catch (e) {
     console.error('POST /images/:id/detach', e);
@@ -482,33 +559,40 @@ router.post('/bulk', async (req, res) => {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length) return res.status(400).json({ error: 'Пустой список' });
 
-    const data = [];
+    // createMany не умеет M:N — создаём по одному
+    const created = [];
     for (const n of items) {
       const _matchId = toInt(n.matchId, null);
       const _tMatchId = toInt(n.tMatchId ?? n.tournamentMatchId, null);
       let _leagueId = toInt(n.leagueId, null);
       let _tournamentId = toInt(n.tournamentId, null);
-      const _teamId = toInt(n.teamId, null);
+      const _teamId = toInt(n.teamId, null); // legacy
+      const _teamIds = parseTeamIds(n.teamIds); // M:N
 
       if (_matchId && _leagueId == null)
         _leagueId = await deriveLeagueIdFromMatchId(_matchId);
       if (_tMatchId && _tournamentId == null)
         _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
-      data.push({
-        title: n.title ?? null,
-        date: toDate(n.date, new Date()),
-        images: toStrArr([...(n.images || []), ...(n.imagesRaw || [])]),
-        leagueId: _leagueId ?? null,
-        matchId: _matchId ?? null,
-        tMatchId: _tMatchId ?? null,
-        tournamentId: _tournamentId ?? null,
-        teamId: _teamId ?? null,
+      const row = await prisma.photo.create({
+        data: {
+          title: n.title ?? null,
+          date: toDate(n.date, new Date()),
+          images: toStrArr([...(n.images || []), ...(n.imagesRaw || [])]),
+          leagueId: _leagueId ?? null,
+          matchId: _matchId ?? null,
+          tMatchId: _tMatchId ?? null,
+          tournamentId: _tournamentId ?? null,
+          teamId: _teamId ?? null, // legacy
+          ...(_teamIds.length
+            ? { teams: { connect: _teamIds.map((id) => ({ id })) } }
+            : {}),
+        },
       });
+      created.push(row);
     }
 
-    const r = await prisma.photo.createMany({ data, skipDuplicates: false });
-    res.status(201).json({ count: r.count });
+    res.status(201).json({ count: created.length, items: created });
   } catch (e) {
     console.error('POST /images/bulk', e);
     res.status(500).json({ error: 'Ошибка пакетного создания' });

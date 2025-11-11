@@ -4,36 +4,32 @@ import { PrismaClient } from '@prisma/client';
 const router = Router();
 const prisma = new PrismaClient();
 
-/* ----------------- helpers ----------------- */
-const safeJSON = (val, fb) => {
+/* --------------- helpers --------------- */
+const safeJSON = (v, fb) => {
   try {
-    return val ? JSON.parse(String(val)) : fb;
+    return v ? JSON.parse(String(v)) : fb;
   } catch {
     return fb;
   }
 };
 const toInt = (v, d = undefined) => (v === '' || v == null ? d : Number(v));
 const toDate = (v, d = undefined) => (v ? new Date(v) : d);
-
-// принимает строку или объект {src|url|path} -> массив строк
-const toStringArray = (val) => {
-  const arr = Array.isArray(val) ? val : [val];
-  return arr
-    .filter(Boolean)
-    .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
-    .filter((s) => typeof s === 'string' && s.length > 0);
-};
-
-const setRaRangeHeaders = (res, name, start, count, total) => {
+const setRange = (res, name, start, count, total) => {
   res.setHeader(
     'Content-Range',
     `${name} ${start}-${start + count - 1}/${total}`
   );
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range');
 };
-
-const buildIncludeFlags = (includeParam) => {
-  const parts = String(includeParam || '')
+const toStrArr = (val) => {
+  const arr = Array.isArray(val) ? val : [val];
+  return arr
+    .filter(Boolean)
+    .map((x) => (typeof x === 'string' ? x : x?.src || x?.url || x?.path || ''))
+    .filter(Boolean);
+};
+const buildIncludeFlags = (p) => {
+  const parts = String(p || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
@@ -49,12 +45,13 @@ const makeInclude = (flags) => {
   const inc = {};
   if (flags?.league) inc.league = true;
   if (flags?.match) inc.match = true;
-  if (flags?.tmatch) inc.tMatch = true;
+  if (flags?.tmatch) inc.tMatch = true; // prisma relation
   if (flags?.tournament) inc.tournament = true;
   if (flags?.team) inc.team = true;
   return inc;
 };
 
+/* auto-fill parents */
 async function deriveLeagueIdFromMatchId(matchId) {
   const id = toInt(matchId, null);
   if (!id) return undefined;
@@ -74,61 +71,44 @@ async function deriveTournamentIdFromTMatchId(tMatchId) {
   return m?.tournamentId ?? undefined;
 }
 
-/* ----------------- GET /news ----------------- */
+/* =========================================================
+   LIST: GET /videos
+   ========================================================= */
 router.get('/', async (req, res) => {
   try {
-    const range = safeJSON(req.query.range, null);
-    const sort = safeJSON(req.query.sort, null);
+    const range = safeJSON(req.query.range, [0, 49]);
+    const sort = safeJSON(req.query.sort, ['date', 'DESC']);
     const filter = safeJSON(req.query.filter, {});
 
-    const start = range ? toInt(range[0], 0) : toInt(req.query._start, 0);
-    const end = range
-      ? toInt(range[1], start + 19)
-      : toInt(req.query._end, start + 19);
+    const [start, end] = range;
     const take = Math.max(0, end - start + 1);
-
-    const q = String(req.query.q ?? filter.q ?? '').trim();
-
-    const allowedSort = new Set(['id', 'date', 'createdAt', 'title']);
-    let orderField = 'date';
-    let orderDir = 'desc';
-    if (Array.isArray(sort) && sort[0] && allowedSort.has(sort[0])) {
-      orderField = sort[0];
-      orderDir = (sort[1] || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
-    } else if (req.query.order) {
-      orderDir =
-        (req.query.order || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
-    }
+    const sortField = String(sort[0] || 'date');
+    const sortOrder =
+      String(sort[1] || 'DESC').toLowerCase() === 'desc' ? 'desc' : 'asc';
+    const incFlags = buildIncludeFlags(req.query.include);
 
     const AND = [];
-    if (q) {
-      AND.push({
-        OR: [
-          { title: { contains: q, mode: 'insensitive' } },
-          { description: { contains: q, mode: 'insensitive' } },
-          { url: { contains: q, mode: 'insensitive' } },
-        ],
-      });
-    }
     if (Array.isArray(filter.id) && filter.id.length) {
       AND.push({ id: { in: filter.id.map(Number).filter(Number.isFinite) } });
     }
-    if (filter.url) {
-      AND.push({ url: { contains: String(filter.url), mode: 'insensitive' } });
-    }
+    const q = (req.query.q ?? filter.q ?? '').toString().trim();
+    if (q) AND.push({ OR: [{ title: { contains: q, mode: 'insensitive' } }] });
 
-    const dateFrom = filter.dateFrom || filter.date_gte;
-    const dateTo = filter.dateTo || filter.date_lte;
-    if (dateFrom || dateTo) {
+    if (typeof filter.title === 'string' && filter.title.trim()) {
+      AND.push({
+        title: { contains: filter.title.trim(), mode: 'insensitive' },
+      });
+    }
+    if (filter.date_gte || filter.date_lte) {
       AND.push({
         date: {
-          gte: dateFrom ? new Date(dateFrom) : undefined,
-          lte: dateTo ? new Date(dateTo) : undefined,
+          gte: filter.date_gte ? new Date(filter.date_gte) : undefined,
+          lte: filter.date_lte ? new Date(filter.date_lte) : undefined,
         },
       });
     }
 
-    // relations
+    // parents
     if (filter.leagueId != null && Number.isFinite(Number(filter.leagueId))) {
       AND.push({ leagueId: Number(filter.leagueId) });
     }
@@ -149,125 +129,147 @@ router.get('/', async (req, res) => {
     }
 
     // media presence
-    if (filter.hasImages === true || String(filter.hasImages) === 'true') {
-      AND.push({ images: { isEmpty: false } });
+    if (filter.hasUrl === true || String(filter.hasUrl) === 'true') {
+      AND.push({ url: { not: null } });
     }
     if (filter.hasVideos === true || String(filter.hasVideos) === 'true') {
       AND.push({ videos: { isEmpty: false } });
     }
-    if (filter.hasUrl === true || String(filter.hasUrl) === 'true') {
-      AND.push({ NOT: { url: null } });
+    if (filter.hasAny === true || String(filter.hasAny) === 'true') {
+      AND.push({
+        OR: [{ url: { not: null } }, { videos: { isEmpty: false } }],
+      });
     }
 
     const where = AND.length ? { AND } : undefined;
-    const incFlags = buildIncludeFlags(req.query.include);
 
-    const [items, total] = await Promise.all([
-      prisma.news.findMany({
-        where,
+    const [rows, total] = await Promise.all([
+      prisma.video.findMany({
         skip: start,
         take,
-        orderBy: { [orderField]: orderDir },
+        where,
+        orderBy: { [sortField]: sortOrder },
         include: makeInclude(incFlags),
       }),
-      prisma.news.count({ where }),
+      prisma.video.count({ where }),
     ]);
 
-    setRaRangeHeaders(res, 'news', start, items.length, total);
-    res.json(items);
-  } catch (err) {
-    console.error(
-      '🔥 Ошибка News GET:',
-      err?.code || '',
-      err?.message || '',
-      err?.meta || err
-    );
-    res.status(500).json({ error: 'Ошибка загрузки новостей' });
+    setRange(res, 'videos', start, rows.length, total);
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео' });
   }
 });
 
-/* ----------------- GET /news/latest ----------------- */
+/* быстрые выборки */
 router.get('/latest', async (req, res) => {
   try {
-    const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 10)));
+    const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 12)));
     const incFlags = buildIncludeFlags(req.query.include);
-
-    const items = await prisma.news.findMany({
+    const rows = await prisma.video.findMany({
       take: limit,
       orderBy: { date: 'desc' },
       include: makeInclude(incFlags),
     });
-    res.json(items);
-  } catch (err) {
-    console.error('🔥 Ошибка News GET /latest:', err);
-    res.status(500).json({ error: 'Ошибка загрузки последних новостей' });
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos/latest', e);
+    res.status(500).json({ error: 'Ошибка загрузки последних видео' });
   }
 });
-
-/* quick by-ids */
+router.get('/by-league/:leagueId(\\d+)', async (req, res) => {
+  try {
+    const leagueId = Number(req.params.leagueId);
+    const rows = await prisma.video.findMany({
+      where: { leagueId },
+      orderBy: { date: 'desc' },
+    });
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos/by-league', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео лиги' });
+  }
+});
+router.get('/by-match/:matchId(\\d+)', async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const rows = await prisma.video.findMany({
+      where: { matchId },
+      orderBy: { date: 'desc' },
+    });
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos/by-match', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео матча' });
+  }
+});
 router.get('/by-tmatch/:tMatchId(\\d+)', async (req, res) => {
   try {
     const tMatchId = Number(req.params.tMatchId);
-    const rows = await prisma.news.findMany({
+    const rows = await prisma.video.findMany({
       where: { tMatchId },
       orderBy: { date: 'desc' },
     });
     res.json(rows);
-  } catch (err) {
-    console.error('🔥 Ошибка News GET /by-tmatch:', err);
-    res
-      .status(500)
-      .json({ error: 'Ошибка загрузки новостей по турнирному матчу' });
+  } catch (e) {
+    console.error('GET /videos/by-tmatch', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео турнирного матча' });
+  }
+});
+router.get('/by-tournament/:tournamentId(\\d+)', async (req, res) => {
+  try {
+    const tournamentId = Number(req.params.tournamentId);
+    const rows = await prisma.video.findMany({
+      where: { tournamentId },
+      orderBy: { date: 'desc' },
+    });
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /videos/by-tournament', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео турнира' });
   }
 });
 router.get('/by-team/:teamId(\\d+)', async (req, res) => {
   try {
     const teamId = Number(req.params.teamId);
-    const rows = await prisma.news.findMany({
+    const rows = await prisma.video.findMany({
       where: { teamId },
       orderBy: { date: 'desc' },
     });
     res.json(rows);
-  } catch (err) {
-    console.error('🔥 Ошибка News GET /by-team:', err);
-    res.status(500).json({ error: 'Ошибка загрузки новостей команды' });
+  } catch (e) {
+    console.error('GET /videos/by-team', e);
+    res.status(500).json({ error: 'Ошибка загрузки видео команды' });
   }
 });
 
-/* ----------------- GET /news/:id ----------------- */
+/* ITEM */
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const incFlags = buildIncludeFlags(req.query.include);
-    const news = await prisma.news.findUnique({
+    const item = await prisma.video.findUnique({
       where: { id },
       include: makeInclude(incFlags),
     });
-    if (!news) return res.status(404).json({ error: 'Новость не найдена' });
-    res.json(news);
-  } catch (err) {
-    console.error(
-      '🔥 Ошибка News GET by ID:',
-      err?.code || '',
-      err?.message || '',
-      err?.meta || err
-    );
-    res.status(500).json({ error: 'Ошибка получения новости' });
+    if (!item) return res.status(404).json({ error: 'Не найдено' });
+    res.json(item);
+  } catch (e) {
+    console.error('GET /videos/:id', e);
+    res.status(500).json({ error: 'Ошибка получения видео' });
   }
 });
 
-/* ----------------- POST /news ----------------- */
+/* CREATE */
 router.post('/', async (req, res) => {
   try {
     const {
       title,
-      description,
-      images = [],
-      imagesRaw = [],
-      videos = [],
-      videosRaw = [],
       date,
       url,
+      videos = [],
+      videosRaw = [],
       leagueId,
       matchId,
       tournamentId,
@@ -275,14 +277,6 @@ router.post('/', async (req, res) => {
       tournamentMatchId,
       teamId,
     } = req.body;
-
-    if (!title || typeof title !== 'string') {
-      return res.status(400).json({ error: 'title обязателен' });
-    }
-
-    const parsedDate = toDate(date, new Date());
-    if (isNaN(parsedDate))
-      return res.status(400).json({ error: 'Некорректная дата' });
 
     const _matchId = toInt(matchId, null);
     const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
@@ -295,17 +289,12 @@ router.post('/', async (req, res) => {
     if (_tMatchId && _tournamentId == null)
       _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
-    const imagesFinal = toStringArray([...images, ...imagesRaw]);
-    const videosFinal = toStringArray([...videos, ...videosRaw]);
-
-    const created = await prisma.news.create({
+    const created = await prisma.video.create({
       data: {
-        title,
-        description,
-        date: parsedDate,
-        url: typeof url === 'string' ? url : url == null ? null : String(url),
-        images: imagesFinal,
-        videos: videosFinal,
+        title: title ?? null,
+        date: toDate(date, new Date()),
+        url: url ? String(url) : null,
+        videos: toStrArr([...videos, ...videosRaw]),
         leagueId: _leagueId ?? null,
         matchId: _matchId ?? null,
         tMatchId: _tMatchId ?? null,
@@ -313,35 +302,23 @@ router.post('/', async (req, res) => {
         teamId: _teamId ?? null,
       },
     });
-
     res.status(201).json(created);
-  } catch (err) {
-    console.error(
-      '🔥 Ошибка News POST:',
-      err?.code || '',
-      err?.message || '',
-      err?.meta || err,
-      {
-        body: req.body,
-      }
-    );
-    res.status(500).json({ error: 'Ошибка создания новости' });
+  } catch (e) {
+    console.error('POST /videos', e);
+    res.status(500).json({ error: 'Ошибка создания видео' });
   }
 });
 
-/* ----------------- PATCH /news/:id ----------------- */
+/* PATCH */
 router.patch('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const {
       title,
-      description,
       date,
-      images,
-      imagesRaw,
+      url,
       videos,
       videosRaw,
-      url,
       leagueId,
       matchId,
       tournamentId,
@@ -352,17 +329,10 @@ router.patch('/:id(\\d+)', async (req, res) => {
 
     const patch = {};
     if (title !== undefined) patch.title = title;
-    if (description !== undefined) patch.description = description;
     if (date !== undefined) patch.date = toDate(date);
-    if (url !== undefined)
-      patch.url =
-        typeof url === 'string' ? url : url == null ? null : String(url);
-
-    if (images !== undefined || imagesRaw !== undefined) {
-      patch.images = toStringArray([...(images || []), ...(imagesRaw || [])]);
-    }
+    if (url !== undefined) patch.url = url ? String(url) : null;
     if (videos !== undefined || videosRaw !== undefined) {
-      patch.videos = toStringArray([...(videos || []), ...(videosRaw || [])]);
+      patch.videos = toStrArr([...(videos || []), ...(videosRaw || [])]);
     }
 
     let _matchId;
@@ -390,6 +360,7 @@ router.patch('/:id(\\d+)', async (req, res) => {
       patch.teamId = toInt(teamId, null);
     }
 
+    // auto-fill
     if (_matchId != null && leagueId === undefined) {
       const derived = await deriveLeagueIdFromMatchId(_matchId);
       if (derived != null) patch.leagueId = derived;
@@ -399,31 +370,24 @@ router.patch('/:id(\\d+)', async (req, res) => {
       if (derived != null) patch.tournamentId = derived;
     }
 
-    const updated = await prisma.news.update({ where: { id }, data: patch });
+    const updated = await prisma.video.update({ where: { id }, data: patch });
     res.json(updated);
-  } catch (err) {
-    console.error('🔥 Ошибка News PATCH:', err);
-    res.status(500).json({ error: 'Ошибка обновления новости' });
+  } catch (e) {
+    console.error('PATCH /videos/:id', e);
+    res.status(500).json({ error: 'Ошибка обновления видео' });
   }
 });
 
-/* ----------------- PUT /news/:id ----------------- */
+/* PUT */
 router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-
-    const exists = await prisma.news.findUnique({ where: { id } });
-    if (!exists) return res.status(404).json({ error: 'Новость не найдена' });
-
     const {
       title,
-      description,
-      images = [],
-      imagesRaw = [],
-      videos = [],
-      videosRaw = [],
       date,
       url,
+      videos = [],
+      videosRaw = [],
       leagueId,
       matchId,
       tournamentId,
@@ -431,10 +395,6 @@ router.put('/:id(\\d+)', async (req, res) => {
       tournamentMatchId,
       teamId,
     } = req.body;
-
-    const parsedDate = toDate(date, exists.date);
-    if (parsedDate && isNaN(parsedDate))
-      return res.status(400).json({ error: 'Некорректная дата' });
 
     const _matchId = toInt(matchId, null);
     const _tMatchId = toInt(tMatchId ?? tournamentMatchId, null);
@@ -447,18 +407,13 @@ router.put('/:id(\\d+)', async (req, res) => {
     if (_tMatchId && _tournamentId == null)
       _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
-    const updatedImages = toStringArray([...images, ...imagesRaw]);
-    const updatedVideos = toStringArray([...videos, ...videosRaw]);
-
-    const updated = await prisma.news.update({
+    const updated = await prisma.video.update({
       where: { id },
       data: {
-        title,
-        description,
-        date: parsedDate,
-        url: typeof url === 'string' ? url : url == null ? null : String(url),
-        images: updatedImages,
-        videos: updatedVideos,
+        title: title ?? null,
+        date: toDate(date),
+        url: url ? String(url) : null,
+        videos: toStrArr([...videos, ...videosRaw]),
         leagueId: _leagueId ?? null,
         matchId: _matchId ?? null,
         tMatchId: _tMatchId ?? null,
@@ -466,15 +421,14 @@ router.put('/:id(\\d+)', async (req, res) => {
         teamId: _teamId ?? null,
       },
     });
-
     res.json(updated);
-  } catch (err) {
-    console.error('🔥 Ошибка News PUT:', err, { body: req.body });
-    res.status(500).json({ error: 'Ошибка обновления новости' });
+  } catch (e) {
+    console.error('PUT /videos/:id', e);
+    res.status(500).json({ error: 'Ошибка обновления видео' });
   }
 });
 
-/* ----------------- POST /news/:id/attach ----------------- */
+/* attach/detach */
 router.post('/:id(\\d+)/attach', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -485,7 +439,7 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
       tMatchId,
       tournamentMatchId,
       teamId,
-    } = req.body;
+    } = req.body || {};
 
     const data = {
       leagueId: leagueId !== undefined ? toInt(leagueId, null) : undefined,
@@ -508,15 +462,13 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
       if (derived != null) data.tournamentId = derived;
     }
 
-    const updated = await prisma.news.update({ where: { id }, data });
+    const updated = await prisma.video.update({ where: { id }, data });
     res.json(updated);
-  } catch (err) {
-    console.error('🔥 Ошибка News attach:', err);
-    res.status(400).json({ error: 'Не удалось привязать сущности' });
+  } catch (e) {
+    console.error('POST /videos/:id/attach', e);
+    res.status(400).json({ error: 'Не удалось привязать' });
   }
 });
-
-/* ----------------- POST /news/:id/detach ----------------- */
 router.post('/:id(\\d+)/detach', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -527,7 +479,7 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
       tournament = false,
       team = false,
     } = req.body || {};
-    const updated = await prisma.news.update({
+    const updated = await prisma.video.update({
       where: { id },
       data: {
         leagueId: league ? null : undefined,
@@ -538,13 +490,13 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
       },
     });
     res.json(updated);
-  } catch (err) {
-    console.error('🔥 Ошибка News detach:', err);
+  } catch (e) {
+    console.error('POST /videos/:id/detach', e);
     res.status(400).json({ error: 'Не удалось снять привязку' });
   }
 });
 
-/* ----------------- BULK create ----------------- */
+/* BULK */
 router.post('/bulk', async (req, res) => {
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -564,17 +516,10 @@ router.post('/bulk', async (req, res) => {
         _tournamentId = await deriveTournamentIdFromTMatchId(_tMatchId);
 
       data.push({
-        title: n.title,
-        description: n.description,
+        title: n.title ?? null,
         date: toDate(n.date, new Date()),
-        url:
-          typeof n.url === 'string'
-            ? n.url
-            : n.url == null
-              ? null
-              : String(n.url),
-        images: toStringArray([...(n.images || []), ...(n.imagesRaw || [])]),
-        videos: toStringArray([...(n.videos || []), ...(n.videosRaw || [])]),
+        url: n.url ? String(n.url) : null,
+        videos: toStrArr([...(n.videos || []), ...(n.videosRaw || [])]),
         leagueId: _leagueId ?? null,
         matchId: _matchId ?? null,
         tMatchId: _tMatchId ?? null,
@@ -583,42 +528,36 @@ router.post('/bulk', async (req, res) => {
       });
     }
 
-    const result = await prisma.news.createMany({ data, skipDuplicates: true });
-    res.status(201).json({ count: result.count });
-  } catch (err) {
-    console.error('🔥 Ошибка News BULK POST:', err);
+    const r = await prisma.video.createMany({ data, skipDuplicates: false });
+    res.status(201).json({ count: r.count });
+  } catch (e) {
+    console.error('POST /videos/bulk', e);
     res.status(500).json({ error: 'Ошибка пакетного создания' });
   }
 });
-
-/* ----------------- BULK delete ----------------- */
 router.delete('/bulk', async (req, res) => {
   try {
     const ids = safeJSON(req.query.ids, []).map(Number).filter(Number.isFinite);
     if (!ids.length) return res.status(400).json({ error: 'Нужно ids' });
-    const result = await prisma.news.deleteMany({ where: { id: { in: ids } } });
-    res.json({ count: result.count });
-  } catch (err) {
-    console.error('🔥 Ошибка News BULK DELETE:', err);
+    const r = await prisma.video.deleteMany({ where: { id: { in: ids } } });
+    res.json({ count: r.count });
+  } catch (e) {
+    console.error('DELETE /videos/bulk', e);
     res.status(500).json({ error: 'Ошибка пакетного удаления' });
   }
 });
 
-/* ----------------- DELETE /news/:id ----------------- */
+/* DELETE */
 router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    await prisma.news.delete({ where: { id } });
+    await prisma.video.delete({ where: { id } });
     res.json({ success: true });
-  } catch (err) {
-    console.error(
-      '🔥 Ошибка News DELETE:',
-      err?.code || '',
-      err?.message || '',
-      err?.meta || err
-    );
-    res.status(500).json({ error: 'Ошибка удаления новости' });
+  } catch (e) {
+    console.error('DELETE /videos/:id', e);
+    res.status(500).json({ error: 'Ошибка удаления видео' });
   }
 });
 
 export default router;
+ 

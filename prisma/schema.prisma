@@ -158,9 +158,13 @@ model Team {
   invites        TeamInvite[]
   TournamentTeam TournamentTeam[]
 
-  News  News[]
-  Photo Photo[]
-  Video Video[]
+  news   News[]  @relation("NewsTeams")
+  photos Photo[] @relation("PhotoTeams")
+  videos Video[] @relation("VideoTeams")
+
+  NewsLegacy  News[]  @relation("NewsTeam_1N")
+  PhotoLegacy Photo[] @relation("PhotoTeam_1N")
+  VideoLegacy Video[] @relation("VideoTeam_1N")
 }
 
 model Player {
@@ -416,7 +420,7 @@ model PlayerStat {
   yellow_cards  Int @default(0)
   red_cards     Int @default(0)
   matchesPlayed Int @default(0)
-  motm            Int        @default(0)
+  motm          Int @default(0)
 
   playerId Int    @unique
   player   Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
@@ -545,8 +549,10 @@ model News {
   tMatchId Int?
   tMatch   TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
 
+  teams Team[] @relation("NewsTeams")
+
   teamId Int?
-  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  team   Team? @relation("NewsTeam_1N", fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
@@ -572,8 +578,10 @@ model Photo {
   tournamentId Int?
   tournament   Tournament?      @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
 
+  teams Team[] @relation("PhotoTeams")
+
   teamId Int?
-  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  team   Team? @relation("PhotoTeam_1N", fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
@@ -601,8 +609,10 @@ model Video {
   tMatchId Int?
   tMatch   TournamentMatch? @relation(fields: [tMatchId], references: [id], onDelete: SetNull)
 
+  teams Team[] @relation("VideoTeams")
+
   teamId Int?
-  team   Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  team   Team? @relation("VideoTeam_1N", fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([leagueId])
   @@index([matchId])
