@@ -1,0 +1,7 @@
+-- baseline: TournamentSuspension manual columns (already exist in DB)
+ALTER TABLE "TournamentSuspension"
+  ADD COLUMN IF NOT EXISTS "totalGames" INTEGER NOT NULL DEFAULT 1,
+  ADD COLUMN IF NOT EXISTS "stage" INTEGER NOT NULL DEFAULT 1,
+  ADD COLUMN IF NOT EXISTS "createdAt" TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  ADD COLUMN IF NOT EXISTS "tournamentMatchId" INTEGER;

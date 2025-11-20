@@ -11,6 +11,35 @@ const prisma = new PrismaClient();
    HELPERS
 ========================================================= */
 
+async function getActiveSuspensionsMapForRosterItems(
+  tournamentId,
+  rosterItemIds,
+  matchDate,
+  tx = prisma
+) {
+  if (!Array.isArray(rosterItemIds) || rosterItemIds.length === 0) {
+    return new Map();
+  }
+  const rows = await tx.tournamentSuspension.findMany({
+    where: {
+      tournamentId,
+      tournamentTeamPlayerId: { in: rosterItemIds },
+      isActive: true,
+      remainingGames: { gt: 0 },
+      OR: [{ startsAfter: null }, { startsAfter: { lt: matchDate } }],
+    },
+    include: {
+      tournamentTeamPlayer: {
+        include: { player: true, tournamentTeam: { include: { team: true } } },
+      },
+      TournamentMatch: true,
+    },
+  });
+  const map = new Map();
+  for (const r of rows) map.set(r.tournamentTeamPlayerId, r);
+  return map;
+}
+
 async function assertRosterItemBelongsToMatch(matchId, rosterItemId) {
   const it = await prisma.tournamentTeamPlayer.findUnique({
     where: { id: Number(rosterItemId) },
@@ -522,8 +551,13 @@ async function countCardsScoped({ tournamentId, rosterItemId, period, match }) {
   return { yellows, reds };
 }
 
-async function maybeCreateSuspensionAfterEvent(createdEvent) {
-  const m = await prisma.tournamentMatch.findUnique({
+// вызывать внутри общей транзакции вместе с созданием события
+// await prisma.$transaction(async (tx) => { const ev = await tx.tournamentEvent.create(...); await maybeCreateSuspensionAfterEvent(ev, tx); });
+
+async function maybeCreateSuspensionAfterEvent(createdEvent, tx = prisma) {
+  if (!createdEvent) return;
+
+  const m = await tx.tournamentMatch.findUnique({
     where: { id: createdEvent.matchId },
     select: {
       id: true,
@@ -533,42 +567,63 @@ async function maybeCreateSuspensionAfterEvent(createdEvent) {
     },
   });
   if (!m) return;
+
   const set = await getDisciplineSettings(m.tournamentId);
   if (!set?.disciplineEnabled) return;
-  if (!createdEvent.rosterItemId) return;
-  if (!['YELLOW_CARD', 'RED_CARD'].includes(createdEvent.type)) return;
 
+  const { rosterItemId, type } = createdEvent;
+  if (!rosterItemId || (type !== 'YELLOW_CARD' && type !== 'RED_CARD')) return;
+
+  // Счётчики ПОСЛЕ добавления текущего события
   const { yellows, reds } = await countCardsScoped({
     tournamentId: m.tournamentId,
-    rosterItemId: createdEvent.rosterItemId,
+    rosterItemId,
     period: set.disciplinePeriod,
     match: m,
   });
 
-  if (createdEvent.type === 'RED_CARD' && reds >= set.redToSuspend) {
-    await prisma.tournamentSuspension.create({
-      data: {
-        tournamentId: m.tournamentId,
-        tournamentTeamPlayerId: createdEvent.rosterItemId,
-        reason: 'RED',
-        startsAfter: m.date,
-        remainingGames: set.suspendGames,
-        triggerMatchId: m.id,
-      },
-    });
+  // Счётчики ДО (исключаем текущий ивент)
+  const prevY = type === 'YELLOW_CARD' ? yellows - 1 : yellows;
+  const prevR = type === 'RED_CARD' ? reds - 1 : reds;
+
+  let reason = null;
+  if (
+    type === 'RED_CARD' &&
+    prevR < set.redToSuspend &&
+    reds >= set.redToSuspend
+  ) {
+    reason = 'RED';
+  } else if (
+    type === 'YELLOW_CARD' &&
+    prevY < set.yellowToSuspend &&
+    yellows >= set.yellowToSuspend
+  ) {
+    reason = 'YELLOWS';
   }
-  if (createdEvent.type === 'YELLOW_CARD' && yellows >= set.yellowToSuspend) {
-    await prisma.tournamentSuspension.create({
-      data: {
-        tournamentId: m.tournamentId,
-        tournamentTeamPlayerId: createdEvent.rosterItemId,
-        reason: 'YELLOWS',
-        startsAfter: m.date,
-        remainingGames: set.suspendGames,
-        triggerMatchId: m.id,
-      },
-    });
-  }
+  if (!reason) return;
+
+  // Не создаём дубль на тот же матч/игрока/причину
+  const exists = await tx.tournamentSuspension.findFirst({
+    where: {
+      tournamentId: m.tournamentId,
+      tournamentTeamPlayerId: rosterItemId,
+      reason,
+      triggerMatchId: m.id,
+    },
+    select: { id: true },
+  });
+  if (exists) return;
+
+  await tx.tournamentSuspension.create({
+    data: {
+      tournamentId: m.tournamentId,
+      tournamentTeamPlayerId: rosterItemId,
+      reason, // 'RED' | 'YELLOWS'
+      startsAfter: m.date,
+      remainingGames: set.suspendGames,
+      triggerMatchId: m.id,
+    },
+  });
 }
 
 async function serveSuspensionsAfterMatch(matchId) {
@@ -2790,10 +2845,17 @@ router.put(
 
       const m = await prisma.tournamentMatch.findUnique({
         where: { id },
-        select: { tournamentId: true, team1TTId: true, team2TTId: true },
+        select: {
+          id: true,
+          date: true,
+          tournamentId: true,
+          team1TTId: true,
+          team2TTId: true,
+        },
       });
       if (!m) return res.status(404).json({ error: 'Матч не найден' });
 
+      // валидация принадлежности командам матча
       const rosterItems = await prisma.tournamentTeamPlayer.findMany({
         where: {
           id: { in: items.map((p) => Number(p.tournamentTeamPlayerId)) },
@@ -2807,11 +2869,64 @@ router.put(
         }
       }
 
+      // проверка активных банов на момент матча
+      const riIds = rosterItems.map((r) => r.id);
+      const suspMap = await getActiveSuspensionsMapForRosterItems(
+        m.tournamentId,
+        riIds,
+        m.date
+      );
+
+      const skipSuspended =
+        String(
+          req.query.skipSuspended || req.body?.skipSuspended || 'false'
+        ) === 'true';
+
+      let toCreate = items.slice();
+      const blocked = [];
+      if (suspMap.size) {
+        toCreate = items.filter((p) => {
+          const blockedSusp = suspMap.get(Number(p.tournamentTeamPlayerId));
+          if (blockedSusp) {
+            blocked.push({
+              rosterItemId: Number(p.tournamentTeamPlayerId),
+              reason: blockedSusp.reason, // 'RED' | 'YELLOWS'
+              remainingGames: blockedSusp.remainingGames,
+              startsAfter: blockedSusp.startsAfter,
+              triggerMatchId: blockedSusp.triggerMatchId,
+              player: {
+                id: blockedSusp.tournamentTeamPlayer?.player?.id ?? null,
+                name: blockedSusp.tournamentTeamPlayer?.player?.name ?? '',
+              },
+              team: {
+                id:
+                  blockedSusp.tournamentTeamPlayer?.tournamentTeam?.team?.id ??
+                  null,
+                title:
+                  blockedSusp.tournamentTeamPlayer?.tournamentTeam?.team
+                    ?.title ?? '',
+              },
+            });
+            return false;
+          }
+          return true;
+        });
+
+        if (blocked.length && !skipSuspended) {
+          return res.status(409).json({
+            error:
+              'В заявке есть дисквалифицированные игроки. Уберите их или добавьте ?skipSuspended=true чтобы пропустить автоматически.',
+            suspended: blocked,
+          });
+        }
+      }
+
+      // сохраняем итоговый список
       await prisma.$transaction(async (tx) => {
         await tx.tournamentPlayerMatch.deleteMany({ where: { matchId: id } });
-        if (items.length) {
+        if (toCreate.length) {
           await tx.tournamentPlayerMatch.createMany({
-            data: items.map((p) => ({
+            data: toCreate.map((p) => ({
               matchId: id,
               tournamentTeamPlayerId: Number(p.tournamentTeamPlayerId),
               role: p.role ?? 'STARTER',
@@ -2824,6 +2939,7 @@ router.put(
           });
         }
       });
+
       const rows = await prisma.tournamentPlayerMatch.findMany({
         where: { matchId: id },
         include: { tournamentTeamPlayer: { include: { player: true } } },
@@ -2836,6 +2952,14 @@ router.put(
         matchId: id,
       });
       await emitLineupFromDB(prisma, id);
+
+      // для совместимости — отдаём rows как и раньше; детали по скипнутым в заголовке
+      if (blocked.length && skipSuspended) {
+        res.setHeader(
+          'X-Suspended-Skipped',
+          encodeURIComponent(JSON.stringify(blocked))
+        );
+      }
       res.json(rows);
     } catch (e) {
       console.error('PUT /tournament-matches/:id/participants', e);
@@ -2876,19 +3000,13 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
   try {
     const matchId = Number(req.params.matchId);
     const {
-      minute,
-      half,
-      type,
-      description,
-      tournamentTeamId,
-      rosterItemId,
-      assistRosterItemId,
-      issuedByRefereeId,
+      minute, half, type, description,
+      tournamentTeamId, rosterItemId, assistRosterItemId, issuedByRefereeId,
     } = req.body;
 
     const m = await prisma.tournamentMatch.findUnique({
       where: { id: matchId },
-      select: { tournamentId: true, team1TTId: true, team2TTId: true },
+      select: { tournamentId: true, date: true, team1TTId: true, team2TTId: true },
     });
     if (!m) return res.status(404).json({ error: 'Матч не найден' });
 
@@ -2911,17 +3029,40 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
         select: { tournamentTeamId: true },
       });
       if (!it || it.tournamentTeamId !== Number(tournamentTeamId)) {
-        return res
-          .status(400)
-          .json({ error: 'Ассистент не из этой заявки/команды' });
+        return res.status(400).json({ error: 'Ассистент не из этой заявки/команды' });
+      }
+    }
+
+    // ⬇️ СНАЧАЛА проверяем дисквалификации
+    const idsToCheck = [
+      toInt(rosterItemId, null),
+      ...(type === 'GOAL' ? [toInt(assistRosterItemId, null)] : []),
+    ].filter(Boolean);
+
+    if (idsToCheck.length) {
+      const suspMap = await getActiveSuspensionsMapForRosterItems(
+        m.tournamentId,
+        idsToCheck,
+        m.date
+      );
+      if (suspMap.size) {
+        return res.status(409).json({
+          error: 'Событие недоступно: один из игроков дисквалифицирован',
+          suspended: idsToCheck
+            .filter(rid => suspMap.has(rid))
+            .map(rid => ({
+              rosterItemId: rid,
+              reason: suspMap.get(rid).reason,
+              remainingGames: suspMap.get(rid).remainingGames,
+            })),
+        });
       }
     }
 
     const providedRefId = toInt(issuedByRefereeId, undefined);
-    const finalRefId =
-      providedRefId !== undefined
-        ? providedRefId
-        : await getDefaultRefereeIdForMatch(matchId);
+    const finalRefId = providedRefId !== undefined
+      ? providedRefId
+      : await getDefaultRefereeIdForMatch(matchId);
 
     const created = await prisma.tournamentMatchEvent.create({
       data: {
@@ -2942,8 +3083,7 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
       },
     });
 
-    if (created.rosterItemId)
-      await incPlayerStatByRoster(created.rosterItemId, created.type);
+    if (created.rosterItemId) await incPlayerStatByRoster(created.rosterItemId, created.type);
     if (created.assistRosterItemId && created.type === 'GOAL')
       await incPlayerStatByRoster(created.assistRosterItemId, 'ASSIST');
 
@@ -2953,34 +3093,27 @@ router.post('/tournament-matches/:matchId(\\d+)/events', async (req, res) => {
 
     const m2 = await prisma.tournamentMatch.findUnique({
       where: { id: matchId },
-      select: {
-        id: true,
-        tournamentId: true,
-        team1Score: true,
-        team2Score: true,
-      },
+      select: { id: true, tournamentId: true, team1Score: true, team2Score: true },
     });
+
     const io = getIO();
     io.to(`tmatch:${matchId}`).emit('tevent:created', created);
     if (m2) {
       io.to(`tmatch:${matchId}`).emit('tmatch:score', {
-        matchId,
-        team1Score: m2.team1Score,
-        team2Score: m2.team2Score,
+        matchId, team1Score: m2.team1Score, team2Score: m2.team2Score,
       });
       io.to(`tournament:${m2.tournamentId}`).emit('tmatch:update', {
-        id: matchId,
-        team1Score: m2.team1Score,
-        team2Score: m2.team2Score,
+        id: matchId, team1Score: m2.team1Score, team2Score: m2.team2Score,
       });
     }
 
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /tournament-matches/:id/events', e);
-    res.status(400).json({ error: 'Ошибка создания события' });
+    res.status(500).json({ error: 'Ошибка создания события' });
   }
 });
+
 
 router.get('/tournament-matches/:matchId(\\d+)/lineup', async (req, res) => {
   try {
@@ -3087,12 +3220,12 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
     const old = await prisma.tournamentMatchEvent.findUnique({ where: { id } });
     if (!old) return res.status(404).json({ error: 'Событие не найдено' });
 
+    // откатываем старую статистику (без двойного dec для ASSIST)
     if (old.rosterItemId)
       await decPlayerStatByRoster(old.rosterItemId, old.type);
-    if (old.type === 'ASSIST' && old.rosterItemId)
-      await decPlayerStatByRoster(old.rosterItemId, 'ASSIST');
-    if (old.assistRosterItemId && old.type === 'GOAL')
+    if (old.assistRosterItemId && old.type === 'GOAL') {
       await decPlayerStatByRoster(old.assistRosterItemId, 'ASSIST');
+    }
 
     const {
       minute,
@@ -3107,33 +3240,80 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
 
     const m = await prisma.tournamentMatch.findUnique({
       where: { id: old.matchId },
-      select: { team1TTId: true, team2TTId: true },
+      select: {
+        team1TTId: true,
+        team2TTId: true,
+        tournamentId: true,
+        date: true,
+      },
     });
-    if (tournamentTeamId != null) {
-      if (![m.team1TTId, m.team2TTId].includes(Number(tournamentTeamId))) {
-        return res.status(400).json({ error: 'Событие не этой команды матча' });
-      }
-    }
-    const ttForCheck = Number(tournamentTeamId ?? old.tournamentTeamId);
 
-    if (toInt(rosterItemId, undefined) !== undefined) {
-      if (toInt(rosterItemId, null)) {
-        const it = await prisma.tournamentTeamPlayer.findUnique({
-          where: { id: Number(rosterItemId) },
-          select: { tournamentTeamId: true },
-        });
-        if (!it || it.tournamentTeamId !== ttForCheck)
-          return res.status(400).json({ error: 'Игрок не из этой заявки' });
+    const ttForCheck =
+      toInt(tournamentTeamId, undefined) !== undefined
+        ? Number(tournamentTeamId)
+        : old.tournamentTeamId;
+    if (![m.team1TTId, m.team2TTId].includes(ttForCheck)) {
+      return res.status(400).json({ error: 'Событие не этой команды матча' });
+    }
+
+    if (
+      toInt(rosterItemId, undefined) !== undefined &&
+      toInt(rosterItemId, null)
+    ) {
+      const it = await prisma.tournamentTeamPlayer.findUnique({
+        where: { id: Number(rosterItemId) },
+        select: { tournamentTeamId: true },
+      });
+      if (!it || it.tournamentTeamId !== ttForCheck) {
+        return res.status(400).json({ error: 'Игрок не из этой заявки' });
       }
     }
-    if (toInt(assistRosterItemId, undefined) !== undefined) {
-      if (toInt(assistRosterItemId, null)) {
-        const it = await prisma.tournamentTeamPlayer.findUnique({
-          where: { id: Number(assistRosterItemId) },
-          select: { tournamentTeamId: true },
+    if (
+      toInt(assistRosterItemId, undefined) !== undefined &&
+      toInt(assistRosterItemId, null)
+    ) {
+      const it = await prisma.tournamentTeamPlayer.findUnique({
+        where: { id: Number(assistRosterItemId) },
+        select: { tournamentTeamId: true },
+      });
+      if (!it || it.tournamentTeamId !== ttForCheck) {
+        return res.status(400).json({ error: 'Ассистент не из этой заявки' });
+      }
+    }
+
+    // проверка банов (эффективные значения)
+    const effRosterId =
+      toInt(rosterItemId, undefined) !== undefined
+        ? toInt(rosterItemId, null)
+        : old.rosterItemId;
+    const effAssistId =
+      toInt(assistRosterItemId, undefined) !== undefined
+        ? toInt(assistRosterItemId, null)
+        : old.assistRosterItemId;
+    const newType = type ?? old.type;
+
+    const idsToCheck = [
+      effRosterId,
+      ...(newType === 'GOAL' ? [effAssistId] : []),
+    ].filter(Boolean);
+    if (idsToCheck.length) {
+      const suspMap = await getActiveSuspensionsMapForRosterItems(
+        m.tournamentId,
+        idsToCheck,
+        m.date
+      );
+      if (suspMap.size) {
+        return res.status(409).json({
+          error:
+            'Редактирование запрещено: игрок дисквалифицирован на этот матч',
+          suspended: idsToCheck
+            .filter((rid) => suspMap.has(rid))
+            .map((rid) => ({
+              rosterItemId: rid,
+              reason: suspMap.get(rid).reason,
+              remainingGames: suspMap.get(rid).remainingGames,
+            })),
         });
-        if (!it || it.tournamentTeamId !== ttForCheck)
-          return res.status(400).json({ error: 'Ассистент не из этой заявки' });
       }
     }
 
@@ -3142,7 +3322,7 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
       data: {
         minute: toInt(minute, 0),
         half: toInt(half, 1),
-        type,
+        type: newType,
         description: description ?? null,
         tournamentTeamId: toInt(tournamentTeamId, undefined),
         rosterItemId: toInt(rosterItemId, null),
@@ -3158,12 +3338,12 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
 
     if (updated.rosterItemId)
       await incPlayerStatByRoster(updated.rosterItemId, updated.type);
-    if (updated.assistRosterItemId && updated.type === 'GOAL')
+    if (updated.assistRosterItemId && updated.type === 'GOAL') {
       await incPlayerStatByRoster(updated.assistRosterItemId, 'ASSIST');
+    }
 
     if (isScoreEvent(updated.type) || isScoreEvent(old.type))
       await recomputeTMatchScore(updated.matchId);
-
     await recalcTotalsIfFinished(updated.matchId);
 
     const m2 = await prisma.tournamentMatch.findUnique({
@@ -3175,6 +3355,7 @@ router.put('/tournament-events/:eventId(\\d+)', async (req, res) => {
         team2Score: true,
       },
     });
+
     const io = getIO();
     io.to(`tmatch:${updated.matchId}`).emit('tevent:updated', updated);
     if (m2) {
@@ -3273,6 +3454,170 @@ router.get('/tournaments/:id(\\d+)/suspensions', async (req, res) => {
     res.status(500).json({ error: 'Ошибка загрузки дисквалификаций' });
   }
 });
+
+router.get(
+  '/tournament-matches/:matchId(\\d+)/suspensions',
+  async (req, res) => {
+    try {
+      const id = Number(req.params.matchId);
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          date: true,
+          tournamentId: true,
+          team1TTId: true,
+          team2TTId: true,
+        },
+      });
+      if (!m) return res.status(404).json({ error: 'Матч не найден' });
+
+      const roster = await prisma.tournamentTeamPlayer.findMany({
+        where: { tournamentTeamId: { in: [m.team1TTId, m.team2TTId] } },
+        select: {
+          id: true,
+          tournamentTeamId: true,
+          player: {
+            select: {
+              id: true,
+              name: true,
+              number: true,
+              position: true,
+              images: true,
+            },
+          },
+        },
+        orderBy: [
+          { tournamentTeamId: 'asc' },
+          { role: 'asc' },
+          { number: 'asc' },
+          { id: 'asc' },
+        ],
+      });
+
+      const riIds = roster.map((r) => r.id);
+      const suspMap = await getActiveSuspensionsMapForRosterItems(
+        m.tournamentId,
+        riIds,
+        m.date
+      );
+
+      const pack = (ttId) =>
+        roster
+          .filter((r) => r.tournamentTeamId === ttId)
+          .map((r) => {
+            const s = suspMap.get(r.id) || null;
+            return {
+              rosterItemId: r.id,
+              playerId: r.player?.id ?? null,
+              name: r.player?.name ?? '',
+              number: r.player?.number ?? null,
+              position: r.player?.position ?? null,
+              isSuspended: !!s,
+              suspension: s
+                ? {
+                    id: s.id,
+                    reason: s.reason, // 'RED' | 'YELLOWS'
+                    remainingGames: s.remainingGames,
+                    startsAfter: s.startsAfter,
+                    triggerMatchId: s.triggerMatchId,
+                  }
+                : null,
+            };
+          });
+
+      res.json({
+        matchId: id,
+        date: m.date,
+        tournamentId: m.tournamentId,
+        team1: { ttId: m.team1TTId, list: pack(m.team1TTId) },
+        team2: { ttId: m.team2TTId, list: pack(m.team2TTId) },
+      });
+    } catch (e) {
+      console.error('GET /tournament-matches/:id/suspensions', e);
+      res.status(500).json({ error: 'Ошибка загрузки дисквалификаций матча' });
+    }
+  }
+);
+
+// GET /tournament-matches/:matchId/eligibility?ttId=123
+router.get(
+  '/tournament-matches/:matchId(\\d+)/eligibility',
+  async (req, res) => {
+    try {
+      const id = Number(req.params.matchId);
+      const ttId = toInt(req.query.ttId, null);
+      if (!ttId) return res.status(400).json({ error: 'ttId обязателен' });
+
+      const m = await prisma.tournamentMatch.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          date: true,
+          tournamentId: true,
+          team1TTId: true,
+          team2TTId: true,
+        },
+      });
+      if (!m) return res.status(404).json({ error: 'Матч не найден' });
+      if (![m.team1TTId, m.team2TTId].includes(ttId)) {
+        return res
+          .status(400)
+          .json({ error: 'Команда не участвует в этом матче' });
+      }
+
+      const roster = await prisma.tournamentTeamPlayer.findMany({
+        where: { tournamentTeamId: ttId },
+        include: { player: true },
+        orderBy: [{ role: 'asc' }, { number: 'asc' }, { id: 'asc' }],
+      });
+
+      const suspMap = await getActiveSuspensionsMapForRosterItems(
+        m.tournamentId,
+        roster.map((r) => r.id),
+        m.date
+      );
+
+      const eligible = [];
+      const suspended = [];
+      for (const r of roster) {
+        const s = suspMap.get(r.id);
+        const obj = {
+          rosterItemId: r.id,
+          playerId: r.playerId,
+          name: r.player?.name ?? '',
+          number: r.number ?? r.player?.number ?? null,
+          position: r.position ?? r.player?.position ?? null,
+          role: r.role ?? 'STARTER',
+        };
+        if (s) {
+          suspended.push({
+            ...obj,
+            suspension: {
+              id: s.id,
+              reason: s.reason,
+              remainingGames: s.remainingGames,
+              startsAfter: s.startsAfter,
+              triggerMatchId: s.triggerMatchId,
+            },
+          });
+        } else {
+          eligible.push(obj);
+        }
+      }
+
+      res.json({
+        matchId: id,
+        ttId,
+        eligible,
+        suspended,
+      });
+    } catch (e) {
+      console.error('GET /tournament-matches/:id/eligibility', e);
+      res.status(500).json({ error: 'Ошибка проверки доступности' });
+    }
+  }
+);
 
 router.post('/tournaments/:id(\\d+)/suspensions/recalc', async (req, res) => {
   try {
