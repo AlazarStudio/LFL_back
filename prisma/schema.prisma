@@ -652,8 +652,8 @@ model TournamentPlayerMatch {
 
 model TournamentSuspension {
   id                     Int                  @id @default(autoincrement())
-  created_at             DateTime             @default(now())
-  updated_at             DateTime
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @default(now()) @updatedAt
   tournamentId           Int
   tournamentTeamPlayerId Int
   reason                 SuspensionReason
@@ -663,8 +663,6 @@ model TournamentSuspension {
   triggerMatchId         Int?
   totalGames             Int                  @default(1)
   stage                  Int                  @default(1)
-  createdAt              DateTime             @default(now())
-  updatedAt              DateTime             @default(now()) @updatedAt
   tournamentMatchId      Int?
   tournament             Tournament           @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
   tournamentTeamPlayer   TournamentTeamPlayer @relation(fields: [tournamentTeamPlayerId], references: [id], onDelete: Cascade)
