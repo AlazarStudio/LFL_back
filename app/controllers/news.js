@@ -41,6 +41,11 @@ const toStrArr = (val) => {
 /** include parser: supports nested keys like:
  * league, match, match.team1, match.team2, tmatch, tmatch.team1TT.team, tmatch.team2TT.team, tournament, teams, team
  */
+/** include parser: supports nested keys like:
+ * league, match, match.team1, match.team2,
+ * tmatch, tmatch.team1, tmatch.team2,
+ * tmatch.team1TT.team, tmatch.team2TT.team, tournament, teams, team
+ */
 function buildIncludeFromQuery(param) {
   const parts = String(param || '')
     .split(',')
@@ -54,7 +59,7 @@ function buildIncludeFromQuery(param) {
   if (has('teams')) include.teams = true; // M2M
   if (has('team')) include.team = true; // legacy single
 
-  // match
+  // match (лиг. матч)
   if (has('match') || has('match.team1') || has('match.team2')) {
     include.match = {
       include: {
@@ -64,27 +69,42 @@ function buildIncludeFromQuery(param) {
     };
   }
 
-  // tournament match
-  if (
+  // tournament match (tMatch):
+  // поддерживаем и прямые team1/team2, и team1TT/team2TT.team
+  const hasTMatch =
     has('tmatch') ||
     has('tournamentmatch') ||
+    has('tmatch.team1') ||
+    has('tmatch.team2') ||
     has('tmatch.team1tt') ||
     has('tmatch.team2tt') ||
     has('tmatch.team1tt.team') ||
-    has('tmatch.team2tt.team')
-  ) {
-    include.tMatch = {
-      include: {
-        team1TT:
-          has('tmatch.team1tt') || has('tmatch.team1tt.team') || has('tmatch')
-            ? { include: { team: has('tmatch.team1tt.team') || has('tmatch') } }
-            : false,
-        team2TT:
-          has('tmatch.team2tt') || has('tmatch.team2tt.team') || has('tmatch')
-            ? { include: { team: has('tmatch.team2tt.team') || has('tmatch') } }
-            : false,
-      },
-    };
+    has('tmatch.team2tt.team');
+
+  if (hasTMatch) {
+    const tInclude = {};
+
+    // прямые связи на Team
+    if (has('tmatch.team1') || has('tmatch')) tInclude.team1 = true;
+    if (has('tmatch.team2') || has('tmatch')) tInclude.team2 = true;
+
+    // TT + team
+    if (has('tmatch.team1tt') || has('tmatch.team1tt.team') || has('tmatch')) {
+      tInclude.team1TT = {
+        include: {
+          team: has('tmatch.team1tt.team') || has('tmatch'),
+        },
+      };
+    }
+    if (has('tmatch.team2tt') || has('tmatch.team2tt.team') || has('tmatch')) {
+      tInclude.team2TT = {
+        include: {
+          team: has('tmatch.team2tt.team') || has('tmatch'),
+        },
+      };
+    }
+
+    include.tMatch = { include: tInclude };
   }
 
   return include;
