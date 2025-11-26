@@ -91,6 +91,8 @@ app.use(errorHandler);
 // server.listen(PORT, () => console.log(`🚀 HTTP + WS server on :${PORT}`));
 
 /* ===== HTTPS (при необходимости) ===== */
+
+
 const sslOptions = {
   key: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/privkey.pem'),
   cert: fs.readFileSync('/etc/letsencrypt/live/backend.mlf09.ru/cert.pem'),
