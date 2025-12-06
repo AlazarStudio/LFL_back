@@ -39,27 +39,34 @@ const toStrArr = (val) => {
 };
 
 /** include parser: supports nested keys like:
- * league, match, match.team1, match.team2, tmatch, tmatch.team1TT.team, tmatch.team2TT.team, tournament, teams, team
- */
-/** include parser: supports nested keys like:
- * league, match, match.team1, match.team2,
- * tmatch, tmatch.team1, tmatch.team2,
- * tmatch.team1TT.team, tmatch.team2TT.team, tournament, teams, team
+ * league, match, match.team1, match.team2, tmatch, tmatch.team1tt.team, tmatch.team2tt.team, tournament, teams, team
  */
 function buildIncludeFromQuery(param) {
   const parts = String(param || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  const has = (p) => parts.includes(p);
+
+  const has = (p) => parts.includes(p.toLowerCase());
 
   const include = {};
+
+  // простые связи
   if (has('league')) include.league = true;
   if (has('tournament')) include.tournament = true;
-  if (has('teams')) include.teams = true; // M2M
-  if (has('team')) include.team = true; // legacy single
 
-  // match (лиг. матч)
+  if (has('teams') || has('team')) {
+    include.teams = {
+      select: {
+        id: true,
+        title: true,
+        smallTitle: true,
+        logo: true,
+      },
+    };
+  }
+
+  // ЛИГОВЫЙ МАТЧ: match.team1 / match.team2
   if (has('match') || has('match.team1') || has('match.team2')) {
     include.match = {
       include: {
@@ -69,43 +76,94 @@ function buildIncludeFromQuery(param) {
     };
   }
 
-  // tournament match (tMatch):
-  // поддерживаем и прямые team1/team2, и team1TT/team2TT.team
-  const hasTMatch =
+  // ТУРНИРНЫЙ МАТЧ: tMatch.team1TT.team / tMatch.team2TT.team
+  const wantTMatch =
     has('tmatch') ||
     has('tournamentmatch') ||
-    has('tmatch.team1') ||
-    has('tmatch.team2') ||
     has('tmatch.team1tt') ||
-    has('tmatch.team2tt') ||
     has('tmatch.team1tt.team') ||
+    has('tmatch.team2tt') ||
     has('tmatch.team2tt.team');
 
-  if (hasTMatch) {
-    const tInclude = {};
+  if (wantTMatch) {
+    include.tMatch = { include: {} };
 
-    // прямые связи на Team
-    if (has('tmatch.team1') || has('tmatch')) tInclude.team1 = true;
-    if (has('tmatch.team2') || has('tmatch')) tInclude.team2 = true;
+    const wantTeam1TT =
+      has('tmatch.team1tt') || has('tmatch.team1tt.team') || has('tmatch');
+    const wantTeam2TT =
+      has('tmatch.team2tt') || has('tmatch.team2tt.team') || has('tmatch');
 
-    // TT + team
-    if (has('tmatch.team1tt') || has('tmatch.team1tt.team') || has('tmatch')) {
-      tInclude.team1TT = {
+    if (wantTeam1TT) {
+      include.tMatch.include.team1TT = {
         include: {
           team: has('tmatch.team1tt.team') || has('tmatch'),
         },
       };
     }
-    if (has('tmatch.team2tt') || has('tmatch.team2tt.team') || has('tmatch')) {
-      tInclude.team2TT = {
+
+    if (wantTeam2TT) {
+      include.tMatch.include.team2TT = {
         include: {
           team: has('tmatch.team2tt.team') || has('tmatch'),
         },
       };
     }
-
-    include.tMatch = { include: tInclude };
   }
+
+  return include;
+}
+
+/* форсируем дефолтные include для матчей и базовых связей */
+function attachDefaultInclude(rawInclude) {
+  const include = { ...(rawInclude || {}) };
+
+  // Лига и турнир по умолчанию
+  if (!('league' in include)) include.league = true;
+  if (!('tournament' in include)) include.tournament = true;
+
+  // Команды (M2M) по умолчанию
+  if (!('teams' in include)) {
+    include.teams = {
+      select: {
+        id: true,
+        title: true,
+        smallTitle: true,
+        logo: true,
+      },
+    };
+  }
+
+  // Обычный матч лиги: всегда тянем team1/team2
+  include.match = {
+    ...(include.match || {}),
+    include: {
+      ...(include.match?.include || {}),
+      team1: true,
+      team2: true,
+    },
+  };
+
+  // Турнирный матч: всегда тянем team1TT.team и team2TT.team
+  const tInc = include.tMatch?.include || {};
+
+  include.tMatch = {
+    ...(include.tMatch || {}),
+    include: {
+      ...tInc,
+      team1TT: {
+        include: {
+          ...(tInc.team1TT?.include || {}),
+          team: true,
+        },
+      },
+      team2TT: {
+        include: {
+          ...(tInc.team2TT?.include || {}),
+          team: true,
+        },
+      },
+    },
+  };
 
   return include;
 }
@@ -144,7 +202,9 @@ router.get('/', async (req, res) => {
     const sortField = String(sort[0] || 'date');
     const sortOrder =
       String(sort[1] || 'DESC').toLowerCase() === 'desc' ? 'desc' : 'asc';
-    const include = buildIncludeFromQuery(req.query.include);
+
+    const includeRaw = buildIncludeFromQuery(req.query.include);
+    const include = attachDefaultInclude(includeRaw);
 
     const AND = [];
 
@@ -250,7 +310,9 @@ router.get('/', async (req, res) => {
 router.get('/latest', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(100, toInt(req.query.limit, 12)));
-    const include = buildIncludeFromQuery(req.query.include);
+    const includeRaw = buildIncludeFromQuery(req.query.include);
+    const include = attachDefaultInclude(includeRaw);
+
     const rows = await prisma.news.findMany({
       take: limit,
       orderBy: { date: 'desc' },
@@ -332,7 +394,8 @@ router.get('/by-team/:teamId(\\d+)', async (req, res) => {
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const include = buildIncludeFromQuery(req.query.include);
+    const includeRaw = buildIncludeFromQuery(req.query.include);
+    const include = attachDefaultInclude(includeRaw);
     const item = await prisma.news.findUnique({ where: { id }, include });
     if (!item) return res.status(404).json({ error: 'Не найдено' });
     res.json(item);
@@ -379,7 +442,7 @@ router.post('/', async (req, res) => {
     const created = await prisma.news.create({
       data: {
         title: title ?? '',
-        description: String(description), // ВАЖНО
+        description: String(description),
         date: toDate(date, new Date()),
         url: url ? String(url) : null,
         images: toStrArr([...images, ...imagesRaw]),
@@ -421,9 +484,9 @@ router.patch('/:id(\\d+)', async (req, res) => {
       tmatchId,
       tournamentMatchId,
       teamId,
-      teamIds, // полная замена M2M
-      teamIdsAdd, // частичное подключение
-      teamIdsRemove, // частичное отключение
+      teamIds,
+      teamIdsAdd,
+      teamIdsRemove,
     } = req.body;
 
     const patch = {};
@@ -577,7 +640,7 @@ router.post('/:id(\\d+)/attach', async (req, res) => {
       tmatchId,
       tournamentMatchId,
       teamId,
-      teamIds, // connect many
+      teamIds,
     } = req.body || {};
 
     const data = {
@@ -623,9 +686,9 @@ router.post('/:id(\\d+)/detach', async (req, res) => {
       match = false,
       tmatch = false,
       tournament = false,
-      team = false, // single scalar
-      teamIds = [], // disconnect many
-      teamsAll = false, // clear all m2m
+      team = false,
+      teamIds = [],
+      teamsAll = false,
     } = req.body || {};
 
     const ops = {
